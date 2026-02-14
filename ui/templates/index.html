@@ -1,0 +1,633 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kuhn Poker Solver - ReBeL Explorer</title>
+    <style>
+        :root {
+            --bg: #1a1a2e;
+            --surface: #16213e;
+            --surface2: #0f3460;
+            --accent: #e94560;
+            --accent2: #533483;
+            --text: #eee;
+            --text-dim: #aaa;
+            --p0-color: #4fc3f7;
+            --p1-color: #ff8a65;
+            --check-color: #66bb6a;
+            --bet-color: #ef5350;
+            --fold-color: #78909c;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+        }
+
+        .header {
+            background: var(--surface);
+            padding: 16px 24px;
+            border-bottom: 2px solid var(--accent);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .header h1 {
+            font-size: 20px;
+            color: var(--accent);
+        }
+
+        .header .info {
+            font-size: 12px;
+            color: var(--text-dim);
+        }
+
+        .controls {
+            background: var(--surface);
+            padding: 12px 24px;
+            display: flex;
+            gap: 16px;
+            align-items: center;
+            border-bottom: 1px solid #333;
+        }
+
+        .controls label { font-size: 12px; color: var(--text-dim); }
+        .controls input {
+            background: var(--bg);
+            border: 1px solid #444;
+            color: var(--text);
+            padding: 6px 12px;
+            border-radius: 4px;
+            width: 100px;
+            font-family: inherit;
+        }
+
+        .controls button {
+            background: var(--accent);
+            border: none;
+            color: white;
+            padding: 8px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-family: inherit;
+            font-weight: bold;
+        }
+
+        .controls button:hover { opacity: 0.9; }
+        .controls button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        .status-bar {
+            padding: 8px 24px;
+            background: var(--surface2);
+            font-size: 12px;
+            display: flex;
+            gap: 24px;
+        }
+
+        .status-bar .stat {
+            display: flex;
+            gap: 6px;
+        }
+
+        .status-bar .stat-label { color: var(--text-dim); }
+        .status-bar .stat-value { color: var(--accent); font-weight: bold; }
+
+        .main-content {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1px;
+            background: #333;
+            min-height: calc(100vh - 140px);
+        }
+
+        .panel {
+            background: var(--bg);
+            padding: 16px;
+            overflow-y: auto;
+        }
+
+        .panel h2 {
+            font-size: 14px;
+            color: var(--accent);
+            margin-bottom: 12px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        /* Strategy Table */
+        .strategy-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+        }
+
+        .strategy-table th {
+            text-align: left;
+            padding: 8px;
+            border-bottom: 2px solid var(--accent);
+            color: var(--text-dim);
+            font-size: 11px;
+            text-transform: uppercase;
+        }
+
+        .strategy-table td {
+            padding: 8px;
+            border-bottom: 1px solid #333;
+        }
+
+        .strategy-table tr:hover { background: var(--surface); }
+
+        .player-badge {
+            display: inline-block;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 10px;
+            font-weight: bold;
+        }
+
+        .player-0 { background: var(--p0-color); color: #000; }
+        .player-1 { background: var(--p1-color); color: #000; }
+
+        .card-badge {
+            display: inline-block;
+            width: 24px;
+            height: 30px;
+            line-height: 30px;
+            text-align: center;
+            background: white;
+            color: #333;
+            border-radius: 3px;
+            font-weight: bold;
+            font-size: 14px;
+        }
+
+        .action-bar {
+            display: flex;
+            gap: 2px;
+            height: 20px;
+            border-radius: 3px;
+            overflow: hidden;
+            min-width: 120px;
+        }
+
+        .action-bar .segment {
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 10px;
+            font-weight: bold;
+            color: #000;
+            transition: width 0.3s ease;
+        }
+
+        .action-bar .check-call { background: var(--check-color); }
+        .action-bar .bet-raise { background: var(--bet-color); }
+        .action-bar .fold { background: var(--fold-color); }
+
+        /* Belief State Display */
+        .belief-grid {
+            display: grid;
+            grid-template-columns: auto repeat(6, 1fr);
+            gap: 1px;
+            font-size: 11px;
+        }
+
+        .belief-grid .cell {
+            padding: 6px 4px;
+            text-align: center;
+            background: var(--surface);
+        }
+
+        .belief-grid .header-cell {
+            background: var(--surface2);
+            font-weight: bold;
+            color: var(--text-dim);
+            font-size: 10px;
+        }
+
+        .belief-grid .label-cell {
+            text-align: right;
+            padding-right: 8px;
+            font-weight: bold;
+        }
+
+        .belief-grid .terminal { color: var(--accent); }
+
+        .belief-heat {
+            display: inline-block;
+            width: 100%;
+            padding: 4px;
+            border-radius: 2px;
+        }
+
+        /* Game Tree */
+        .tree-container {
+            padding: 16px;
+        }
+
+        .tree-node {
+            margin: 8px 0;
+            padding: 8px 12px;
+            background: var(--surface);
+            border-radius: 6px;
+            border-left: 3px solid #444;
+            cursor: pointer;
+        }
+
+        .tree-node:hover { background: var(--surface2); }
+        .tree-node.selected { border-left-color: var(--accent); }
+        .tree-node.terminal { border-left-color: var(--fold-color); }
+
+        .tree-node .node-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 4px;
+        }
+
+        .tree-node .node-label { font-weight: bold; font-size: 13px; }
+        .tree-node .node-action {
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 10px;
+        }
+
+        .tree-children {
+            margin-left: 20px;
+            border-left: 1px dashed #444;
+            padding-left: 12px;
+        }
+
+        .belief-mini {
+            display: flex;
+            gap: 2px;
+            margin-top: 4px;
+        }
+
+        .belief-mini .bar {
+            height: 6px;
+            border-radius: 1px;
+            transition: width 0.3s ease;
+        }
+
+        /* Detail Panel */
+        .detail-section {
+            margin-top: 16px;
+            padding: 12px;
+            background: var(--surface);
+            border-radius: 6px;
+        }
+
+        .detail-section h3 {
+            font-size: 12px;
+            color: var(--text-dim);
+            margin-bottom: 8px;
+        }
+
+        .loading {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 200px;
+            color: var(--text-dim);
+        }
+
+        .tab-bar {
+            display: flex;
+            gap: 2px;
+            margin-bottom: 12px;
+        }
+
+        .tab-bar button {
+            background: var(--surface);
+            border: none;
+            color: var(--text-dim);
+            padding: 8px 16px;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 12px;
+            border-radius: 4px 4px 0 0;
+        }
+
+        .tab-bar button.active {
+            background: var(--surface2);
+            color: var(--accent);
+        }
+
+        .pbs-explanation {
+            font-size: 11px;
+            color: var(--text-dim);
+            line-height: 1.6;
+            margin-top: 12px;
+            padding: 8px;
+            background: var(--surface);
+            border-radius: 4px;
+            border-left: 3px solid var(--accent2);
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Kuhn Poker Solver</h1>
+        <div class="info">ReBeL-style Public Belief State Explorer</div>
+    </div>
+
+    <div class="controls">
+        <label>Iterations:</label>
+        <input type="number" id="iterations" value="10000" min="100" step="1000">
+        <button id="solve-btn" onclick="solve()">Solve</button>
+        <span id="solve-status" style="font-size: 12px; color: var(--text-dim);"></span>
+    </div>
+
+    <div class="status-bar" id="status-bar">
+        <div class="stat">
+            <span class="stat-label">Status:</span>
+            <span class="stat-value" id="stat-status">Not solved</span>
+        </div>
+        <div class="stat">
+            <span class="stat-label">Exploitability:</span>
+            <span class="stat-value" id="stat-exploit">—</span>
+        </div>
+        <div class="stat">
+            <span class="stat-label">Iterations:</span>
+            <span class="stat-value" id="stat-iters">—</span>
+        </div>
+        <div class="stat">
+            <span class="stat-label">Game Value (P0):</span>
+            <span class="stat-value" id="stat-gv">-0.0556</span>
+        </div>
+    </div>
+
+    <div class="main-content">
+        <div class="panel" id="left-panel">
+            <div class="tab-bar">
+                <button class="active" onclick="showTab('strategy')">Strategy</button>
+                <button onclick="showTab('tree')">Game Tree</button>
+            </div>
+
+            <div id="tab-strategy">
+                <h2>Nash Equilibrium Strategy</h2>
+                <div id="strategy-content">
+                    <div class="loading">Click "Solve" to compute</div>
+                </div>
+            </div>
+
+            <div id="tab-tree" style="display:none;">
+                <h2>Game Tree</h2>
+                <div id="tree-content">
+                    <div class="loading">Click "Solve" to compute</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel" id="right-panel">
+            <h2>Public Belief States</h2>
+            <div id="belief-content">
+                <div class="loading">Click "Solve" to compute</div>
+            </div>
+
+            <div class="pbs-explanation">
+                <strong>Public Belief State (PBS):</strong> A probability distribution over all
+                possible card deals, conditioned on the public action history.
+                <br><br>
+                <strong>PBS(h) = P(cards | history h)</strong> ∝ chance(cards) × reach₀(cards, h) × reach₁(cards, h)
+                <br><br>
+                In ReBeL, instead of searching from information states, the AI searches
+                from PBS. A value network V(PBS) predicts expected payoffs, replacing
+                full tree traversal at depth limits.
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const DEAL_COLORS = [
+            '#e57373', '#64b5f6', '#81c784', '#ffb74d', '#ba68c8', '#4dd0e1'
+        ];
+
+        function showTab(name) {
+            document.getElementById('tab-strategy').style.display = name === 'strategy' ? '' : 'none';
+            document.getElementById('tab-tree').style.display = name === 'tree' ? '' : 'none';
+            document.querySelectorAll('.tab-bar button').forEach((btn, i) => {
+                btn.classList.toggle('active', (i === 0 && name === 'strategy') || (i === 1 && name === 'tree'));
+            });
+        }
+
+        async function solve() {
+            const btn = document.getElementById('solve-btn');
+            const status = document.getElementById('solve-status');
+            const iters = parseInt(document.getElementById('iterations').value);
+
+            btn.disabled = true;
+            status.textContent = 'Solving...';
+
+            try {
+                const resp = await fetch('/api/solve', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({iterations: iters}),
+                });
+                const data = await resp.json();
+
+                document.getElementById('stat-status').textContent = 'Solved';
+                document.getElementById('stat-exploit').textContent = data.exploitability.toFixed(6);
+                document.getElementById('stat-iters').textContent = data.iterations;
+
+                await Promise.all([loadStrategy(), loadBeliefs(), loadTree()]);
+                status.textContent = 'Done!';
+            } catch (e) {
+                status.textContent = 'Error: ' + e.message;
+            }
+
+            btn.disabled = false;
+        }
+
+        async function loadStrategy() {
+            const resp = await fetch('/api/strategy');
+            const data = await resp.json();
+
+            let html = '<table class="strategy-table">';
+            html += '<tr><th>Player</th><th>Card</th><th>History</th><th>Strategy</th><th>Probabilities</th></tr>';
+
+            for (const [key, info] of Object.entries(data)) {
+                const playerClass = info.player === 0 ? 'player-0' : 'player-1';
+                const playerLabel = info.player === 0 ? 'OOP' : 'IP';
+
+                // Build action bar
+                const actions = Object.entries(info.actions);
+                let barHtml = '<div class="action-bar">';
+                for (const [label, prob] of actions) {
+                    const pct = (prob * 100).toFixed(0);
+                    let cls = 'check-call';
+                    if (label === 'Bet') cls = 'bet-raise';
+                    else if (label === 'Fold') cls = 'fold';
+                    barHtml += `<div class="segment ${cls}" style="width:${pct}%">${pct > 10 ? pct + '%' : ''}</div>`;
+                }
+                barHtml += '</div>';
+
+                const probText = actions.map(([l, p]) => `${l}: ${(p*100).toFixed(1)}%`).join(', ');
+
+                html += `<tr>
+                    <td><span class="player-badge ${playerClass}">${playerLabel}</span></td>
+                    <td><span class="card-badge">${info.card}</span></td>
+                    <td>${info.history}</td>
+                    <td>${barHtml}</td>
+                    <td style="font-size:11px;color:var(--text-dim)">${probText}</td>
+                </tr>`;
+            }
+            html += '</table>';
+
+            document.getElementById('strategy-content').innerHTML = html;
+        }
+
+        async function loadBeliefs() {
+            const resp = await fetch('/api/beliefs');
+            const data = await resp.json();
+
+            let html = '<div class="belief-grid">';
+
+            // Header row
+            html += '<div class="cell header-cell">History</div>';
+            for (const label of data.deal_labels) {
+                html += `<div class="cell header-cell">${label}</div>`;
+            }
+
+            // Data rows
+            for (const entry of data.histories) {
+                const termClass = entry.is_terminal ? 'terminal' : '';
+                const label = entry.history + (entry.is_terminal ? ' ✗' : '');
+                html += `<div class="cell label-cell ${termClass}">${label}</div>`;
+
+                for (let i = 0; i < entry.belief.length; i++) {
+                    const b = entry.belief[i];
+                    const intensity = Math.round(b * 255 * 3);
+                    const bg = `rgba(233, 69, 96, ${Math.min(b * 3, 1).toFixed(2)})`;
+                    html += `<div class="cell"><span class="belief-heat" style="background:${bg}">${(b*100).toFixed(1)}%</span></div>`;
+                }
+            }
+
+            html += '</div>';
+
+            // Add reach probability sections
+            html += '<div class="detail-section"><h3>Reach Probabilities (Player 0 - OOP)</h3>';
+            html += '<div class="belief-grid">';
+            html += '<div class="cell header-cell">History</div>';
+            for (const label of data.deal_labels) {
+                html += `<div class="cell header-cell">${label}</div>`;
+            }
+            for (const entry of data.histories) {
+                if (entry.is_terminal) continue;
+                html += `<div class="cell label-cell">${entry.history}</div>`;
+                for (let i = 0; i < entry.reach_p0.length; i++) {
+                    const r = entry.reach_p0[i];
+                    const bg = `rgba(79, 195, 247, ${Math.min(r, 1).toFixed(2)})`;
+                    html += `<div class="cell"><span class="belief-heat" style="background:${bg}">${r.toFixed(4)}</span></div>`;
+                }
+            }
+            html += '</div></div>';
+
+            html += '<div class="detail-section"><h3>Reach Probabilities (Player 1 - IP)</h3>';
+            html += '<div class="belief-grid">';
+            html += '<div class="cell header-cell">History</div>';
+            for (const label of data.deal_labels) {
+                html += `<div class="cell header-cell">${label}</div>`;
+            }
+            for (const entry of data.histories) {
+                if (entry.is_terminal) continue;
+                html += `<div class="cell label-cell">${entry.history}</div>`;
+                for (let i = 0; i < entry.reach_p1.length; i++) {
+                    const r = entry.reach_p1[i];
+                    const bg = `rgba(255, 138, 101, ${Math.min(r, 1).toFixed(2)})`;
+                    html += `<div class="cell"><span class="belief-heat" style="background:${bg}">${r.toFixed(4)}</span></div>`;
+                }
+            }
+            html += '</div></div>';
+
+            document.getElementById('belief-content').innerHTML = html;
+        }
+
+        async function loadTree() {
+            const resp = await fetch('/api/tree');
+            const data = await resp.json();
+
+            function renderNode(node, depth = 0) {
+                const termClass = node.is_terminal ? 'terminal' : '';
+                let html = `<div class="tree-node ${termClass}">`;
+                html += '<div class="node-header">';
+                html += `<span class="node-label">${node.history}`;
+                if (node.action) {
+                    const actionColor = node.action_code === 'b' ? 'var(--bet-color)' :
+                                       node.action_code === 'f' ? 'var(--fold-color)' : 'var(--check-color)';
+                    html += ` <span class="node-action" style="background:${actionColor};color:#000">${node.action}</span>`;
+                }
+                html += '</span>';
+                if (node.player !== null && node.player !== undefined) {
+                    const pc = node.player === 0 ? 'player-0' : 'player-1';
+                    const pl = node.player === 0 ? 'OOP' : 'IP';
+                    html += `<span class="player-badge ${pc}">${pl}</span>`;
+                }
+                if (node.ev_p0 !== undefined) {
+                    html += `<span style="font-size:11px;color:var(--text-dim)">EV: ${node.ev_p0.toFixed(4)}</span>`;
+                }
+                html += '</div>';
+
+                // Mini belief bar
+                if (node.belief) {
+                    html += '<div class="belief-mini">';
+                    for (let i = 0; i < node.belief.length; i++) {
+                        const w = Math.max(node.belief[i] * 100, 1);
+                        html += `<div class="bar" style="width:${w}%;background:${DEAL_COLORS[i]}"></div>`;
+                    }
+                    html += '</div>';
+                }
+
+                // Strategy info
+                if (node.strategies) {
+                    html += '<div style="margin-top:6px;font-size:11px;">';
+                    for (const [card, strat] of Object.entries(node.strategies)) {
+                        html += `<span class="card-badge" style="width:18px;height:22px;line-height:22px;font-size:11px;">${card}</span> `;
+                        for (const [action, prob] of Object.entries(strat)) {
+                            const pct = (prob * 100).toFixed(0);
+                            html += `<span style="color:var(--text-dim)">${action}:${pct}%</span> `;
+                        }
+                        html += '&nbsp;&nbsp;';
+                    }
+                    html += '</div>';
+                }
+
+                html += '</div>';
+
+                if (node.children) {
+                    html += '<div class="tree-children">';
+                    for (const child of node.children) {
+                        html += renderNode(child, depth + 1);
+                    }
+                    html += '</div>';
+                }
+
+                return html;
+            }
+
+            document.getElementById('tree-content').innerHTML = renderNode(data);
+        }
+
+        // Auto-solve on load if already solved
+        fetch('/api/info').then(r => r.json()).then(data => {
+            if (data.solved) {
+                document.getElementById('stat-status').textContent = 'Solved';
+                document.getElementById('stat-exploit').textContent = data.exploitability.toFixed(6);
+                document.getElementById('stat-iters').textContent = data.iterations;
+                loadStrategy();
+                loadBeliefs();
+                loadTree();
+            }
+        });
+    </script>
+</body>
+</html>

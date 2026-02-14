@@ -1,0 +1,13 @@
+[project]
+name = "rebel-poker"
+version = "0.1.0"
+description = "ReBeL-style poker solver starting from Kuhn Poker CFR"
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0",
+    "flask>=3.0",
+    "pytest>=7.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
