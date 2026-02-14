@@ -16,6 +16,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+from game_interface import Game
+
 NUM_CARDS = 3
 CARD_RANKS = list(range(NUM_CARDS))
 RANK_NAMES = {0: "J", 1: "Q", 2: "K"}
@@ -135,3 +137,7 @@ class KuhnPoker:
                         continue
                 infosets.append(f"{RANK_NAMES[card]}|{h}")
         return infosets
+
+
+# Verify KuhnPoker satisfies the Game protocol at import time
+assert isinstance(KuhnPoker(), Game), "KuhnPoker must implement the Game protocol"

@@ -24,7 +24,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
-from kuhn.game import KuhnPoker, KuhnState, RANK_NAMES, CARD_RANKS
+from game_interface import Game
+from kuhn.game import KuhnPoker, RANK_NAMES, CARD_RANKS
 from kuhn.belief_state import ALL_DEALS, NUM_DEALS, CARD_TO_DEALS_P0, CARD_TO_DEALS_P1
 
 
@@ -49,7 +50,7 @@ class SubgameSolver:
 
     def __init__(
         self,
-        game: KuhnPoker,
+        game: Game,
         root_history: str,
         initial_beliefs: torch.Tensor,
         value_fn: Optional[Callable[[torch.Tensor, str], torch.Tensor]] = None,

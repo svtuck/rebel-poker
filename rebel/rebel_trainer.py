@@ -25,6 +25,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+from game_interface import Game
 from kuhn.game import KuhnPoker, RANK_NAMES, CARD_RANKS
 from kuhn.belief_state import (
     ALL_DEALS,

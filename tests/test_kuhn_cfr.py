@@ -10,6 +10,7 @@ import math
 import pytest
 import torch
 
+from game_interface import Game
 from kuhn.game import KuhnPoker, RANK_NAMES
 from kuhn.cfr import CFRTrainer
 from kuhn.belief_state import (
@@ -19,6 +20,21 @@ from kuhn.belief_state import (
     NUM_DEALS,
     initial_chance_probs,
 )
+
+
+class TestGameInterface:
+    def test_kuhn_implements_game_protocol(self):
+        """KuhnPoker must satisfy the Game protocol."""
+        game = KuhnPoker()
+        assert isinstance(game, Game)
+
+    def test_cfr_accepts_generic_game(self):
+        """CFRTrainer should accept any Game, not just KuhnPoker."""
+        game: Game = KuhnPoker()
+        trainer = CFRTrainer(game)
+        trainer.train(100)
+        exp = trainer.exploitability()
+        assert exp < 0.5
 
 
 class TestKuhnPokerGame:
