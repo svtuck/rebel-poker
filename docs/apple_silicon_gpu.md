@@ -1,89 +1,168 @@
 # Custom GPU Kernels on Apple Silicon
 
-Since Triton doesn't support Apple Silicon, here are the frameworks for writing
-custom GPU kernels on Mac Studio:
+Triton does not support Apple Silicon (Metal backend only). Here are the
+viable options for GPU-accelerated poker solving on Mac Studio.
 
-## 1. MLX (Recommended for ML workloads)
+## Framework Comparison
 
-Apple's ML framework with native Apple Silicon support.
+| Framework | Custom Kernels | Autodiff | Python API | Effort |
+|-----------|---------------|----------|------------|--------|
+| MLX       | Yes (Metal)   | Yes      | NumPy-like | Low    |
+| PyTorch MPS | No          | Yes      | PyTorch    | Low    |
+| Metal (PyObjC) | Yes      | No       | Verbose    | High   |
+
+## 1. MLX (Recommended)
+
+Apple's ML framework. Best balance of custom kernel support and usability.
 
 ```python
 import mlx.core as mx
 from mlx.core.fast import metal_kernel
 
-# Custom Metal kernel via MLX
+# Example: vectorized regret matching across all infosets
 source = """
-    uint index = thread_position_in_grid.x;
-    if (index < input.size()) {
-        output[index] = input[index] * scale;
-    }
+    uint idx = thread_position_in_grid.x;
+    float r = regrets[idx];
+    float pos = r > 0.0f ? r : 0.0f;
+    strategy[idx] = pos;  // unnormalized; normalize in Python
 """
 
-kernel = metal_kernel(
-    name="scale_kernel",
-    input_names=["input"],
-    output_names=["output"],
+regret_match = metal_kernel(
+    name="regret_match",
+    input_names=["regrets"],
+    output_names=["strategy"],
     source=source,
+)
+
+# Usage: single GPU dispatch for all infosets
+regrets = mx.array([...])  # all infoset regrets flattened
+strategy = regret_match(
+    inputs=[regrets],
+    output_shapes=[regrets.shape],
+    output_dtypes=[mx.float32],
+    grid=(regrets.size, 1, 1),
+    threadgroup=(256, 1, 1),
 )
 ```
 
-Key advantages:
-- Unified memory (no CPU<->GPU copies)
-- NumPy-like API
-- `mlx.core.fast.metal_kernel()` for custom kernels
-- Automatic differentiation support
+Key properties:
+- **Unified memory**: no CPU<->GPU transfer cost
+- **Lazy evaluation**: operations are batched and fused automatically
+- `mlx.core.fast.metal_kernel()` for custom Metal Shading Language kernels
+- Autodiff works through custom kernels via `mx.custom_function`
 
-## 2. Metal Compute Shaders (Full control)
+### CFR-specific MLX patterns
 
-Write kernels in Metal Shading Language (MSL), a C++14-based language.
+For poker CFR, the key GPU-friendly operations are:
 
-```metal
-// kernel.metal
-kernel void cfr_update(
-    device float* regrets [[buffer(0)]],
-    device float* values [[buffer(1)]],
-    device float* strategy [[buffer(2)]],
-    uint id [[thread_position_in_grid]]
-) {
-    float positive_regret = max(regrets[id], 0.0f);
-    // ... CFR regret matching logic
-}
-```
+1. **Regret matching**: embarrassingly parallel across infosets
+2. **Reach probability propagation**: matrix multiply (deals x actions)
+3. **Belief state normalization**: reduce + broadcast
+4. **Value network forward/backward**: standard NN ops
 
-Access from Python via PyObjC:
 ```python
-import Metal
-device = Metal.MTLCreateSystemDefaultDevice()
-library = device.newLibraryWithSource_options_error_(kernel_source, None, None)
+# Vectorized belief state computation in MLX
+def compute_pbs(chance_probs, reach_p0, reach_p1):
+    """All operations are lazy — MLX fuses them into one GPU dispatch."""
+    joint = chance_probs * reach_p0 * reach_p1
+    return joint / joint.sum()
 ```
 
-## 3. PyTorch MPS Backend
+## 2. PyTorch MPS Backend
+
+Best for value/policy network training where you want standard PyTorch APIs.
 
 ```python
 import torch
-device = torch.device("mps")  # Apple GPU
-tensor = torch.randn(1000, device=device)
+device = torch.device("mps")
+
+# Value network training on Apple GPU
+model = ValueNetwork().to(device)
+pbs = torch.randn(batch_size, num_deals, device=device)
+values = model(pbs)
 ```
 
-Supports standard tensor operations. Limited custom kernel support but growing.
+Limitations:
+- No custom kernel API (as of PyTorch 2.x)
+- Some ops not yet supported on MPS (check `torch.backends.mps.is_available()`)
+- Good for NN training, not ideal for CFR tree traversal
 
-## Recommendation for ReBeL
+## 3. Metal Compute Shaders (via PyObjC)
 
-1. **Start with PyTorch MPS** for standard tensor operations (belief state
-   tracking, value network training, strategy computation)
+Full control but high complexity. Use only for performance-critical paths
+that MLX can't handle.
 
-2. **Use MLX metal_kernel()** for custom operations:
-   - Vectorized CFR updates across all information sets
-   - Batch reach probability propagation
-   - Belief state normalization across large deal sets
+```python
+import Metal
 
-3. **Consider pure Metal** only if MLX kernels aren't flexible enough
-   for complex CFR tree traversals
+device = Metal.MTLCreateSystemDefaultDevice()
+source = """
+#include <metal_stdlib>
+using namespace metal;
 
-## Performance Notes
+kernel void cfr_update(
+    device float* regrets [[buffer(0)]],
+    device float* strategy [[buffer(1)]],
+    device float* reach    [[buffer(2)]],
+    constant uint& n_infosets [[buffer(3)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id >= n_infosets) return;
 
-- Mac Studio M2 Ultra: 76 GPU cores, 192GB unified memory
-- Unified memory means no PCIe transfer overhead
-- For poker tree traversal, the bottleneck is often tree structure (branching),
-  not raw compute — so batching across deals/hands is key
-- MLX lazy evaluation can help batch multiple operations
+    // Regret matching for 2-action infosets
+    uint base = id * 2;
+    float r0 = max(regrets[base], 0.0f);
+    float r1 = max(regrets[base + 1], 0.0f);
+    float total = r0 + r1;
+
+    if (total > 0.0f) {
+        strategy[base] = r0 / total;
+        strategy[base + 1] = r1 / total;
+    } else {
+        strategy[base] = 0.5f;
+        strategy[base + 1] = 0.5f;
+    }
+}
+"""
+
+result = device.newLibraryWithSource_options_error_(source, None, None)
+library = result[0]
+fn = library.newFunctionWithName_("cfr_update")
+pipeline = device.newComputePipelineStateWithFunction_error_(fn, None)[0]
+```
+
+## Recommended Architecture for ReBeL on Mac Studio
+
+```
++------------------------------------------+
+|  Python Orchestration Layer               |
+|  (game tree structure, training loop)     |
++------------------------------------------+
+        |                      |
++----------------+   +------------------+
+| MLX Backend    |   | PyTorch MPS      |
+| - CFR updates  |   | - Value network  |
+| - Reach probs  |   | - Policy network |
+| - PBS compute  |   | - Training loop  |
+| - Custom Metal |   |                  |
++----------------+   +------------------+
+        |                      |
++------------------------------------------+
+|  Apple Silicon Unified Memory             |
+|  (M2 Ultra: 76 GPU cores, 192GB)         |
++------------------------------------------+
+```
+
+### Migration path from current code
+
+1. **Phase 1 (now)**: PyTorch CPU — validates correctness
+2. **Phase 2**: PyTorch MPS — GPU-accelerate value net training
+3. **Phase 3**: MLX — port CFR tensor ops for GPU-native solving
+4. **Phase 4**: Custom Metal kernels via MLX for hot paths
+
+### Performance expectations
+
+- Kuhn Poker: too small to benefit from GPU (6 deals, ~12 infosets)
+- Leduc Poker: moderate benefit (936 deals, ~936 infosets)
+- NLHE River: significant benefit (millions of states, GPU parallelism essential)
+- The main win is parallelizing across deals/hands in the vectorized CFR

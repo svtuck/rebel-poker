@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import sys
 from kuhn.game import KuhnPoker, RANK_NAMES
-from kuhn.cfr import CFRTrainer
+from cfr.solver import CFRTrainer
+from cfr.vectorized import VectorizedCFR
 from kuhn.belief_state import (
     BeliefStateTracker,
-    VectorizedCFR,
     ALL_DEALS,
     NUM_DEALS,
 )
@@ -33,7 +33,7 @@ def print_separator(title=""):
 def run_scalar_cfr(iterations=10000):
     """Run scalar (traditional) CFR."""
     print_separator("Scalar CFR")
-    trainer = CFRTrainer()
+    trainer = CFRTrainer(KuhnPoker())
     exploitabilities = trainer.train(iterations)
     profile = trainer.average_strategy_profile()
 
@@ -46,7 +46,6 @@ def run_scalar_cfr(iterations=10000):
 
     for key in sorted(profile.keys()):
         probs = profile[key]
-        # Use game action order: c first, then b/f
         parts = key.split("|")
         history = parts[1] if len(parts) > 1 else ""
         if history in ("", "c"):
@@ -62,7 +61,7 @@ def run_scalar_cfr(iterations=10000):
 def run_vectorized_cfr(iterations=10000):
     """Run vectorized (tensor-based) CFR."""
     print_separator("Vectorized CFR (PyTorch)")
-    vcfr = VectorizedCFR()
+    vcfr = VectorizedCFR(KuhnPoker())
     exploitabilities = vcfr.train(iterations)
     profile = vcfr.average_strategy_profile()
 
@@ -166,7 +165,7 @@ def main():
         iterations = int(sys.argv[1])
 
     print(f"Running Kuhn Poker solver with {iterations} CFR iterations")
-    print(f"Known Nash game value: -1/18 ≈ {-1/18:.6f}")
+    print(f"Known Nash game value: -1/18 = {-1/18:.6f}")
 
     # Run scalar CFR
     scalar_trainer, scalar_profile = run_scalar_cfr(iterations)

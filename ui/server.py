@@ -15,10 +15,10 @@ from flask import Flask, jsonify, render_template, request
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from kuhn.game import KuhnPoker, RANK_NAMES
-from kuhn.cfr import CFRTrainer
+from cfr.solver import CFRTrainer
+from cfr.vectorized import VectorizedCFR
 from kuhn.belief_state import (
     BeliefStateTracker,
-    VectorizedCFR,
     ALL_DEALS,
     NUM_DEALS,
 )
@@ -49,7 +49,7 @@ def solve():
     data = request.json or {}
     iterations = data.get("iterations", 10000)
 
-    trainer = CFRTrainer()
+    trainer = CFRTrainer(KuhnPoker())
     trainer.train(iterations)
     profile = trainer.average_strategy_profile()
 
@@ -248,7 +248,7 @@ def info():
 if __name__ == "__main__":
     # Auto-solve on startup
     print("Solving Kuhn Poker (10000 iterations)...")
-    trainer = CFRTrainer()
+    trainer = CFRTrainer(KuhnPoker())
     trainer.train(10000)
     profile = trainer.average_strategy_profile()
     tracker = BeliefStateTracker()

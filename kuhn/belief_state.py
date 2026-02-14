@@ -14,9 +14,9 @@ operating over ALL card deals simultaneously. This is the foundation for
 batch CFR and eventual neural network value/policy training.
 
 Tensor layout:
-  - deals: [6] possible card deals (i,j) where i≠j, i,j ∈ {0,1,2}
+  - deals: [6] possible card deals (i,j) where i!=j, i,j in {0,1,2}
   - For each deal, we track reach probabilities for both players
-  - PBS at any public history = normalized product of reaches × chance probs
+  - PBS at any public history = normalized product of reaches x chance probs
 """
 
 from __future__ import annotations
@@ -52,8 +52,8 @@ class BeliefStateTracker:
     """Tracks public belief states across the Kuhn Poker game tree.
 
     For each public history, maintains:
-      - reach_probs[player]: shape [6] — reach probability for each deal
-      - belief: shape [6] — normalized PBS
+      - reach_probs[player]: shape [6] -- reach probability for each deal
+      - belief: shape [6] -- normalized PBS
 
     The strategy is represented as a dict mapping infoset keys to
     action probability tensors.
@@ -166,7 +166,7 @@ class BeliefStateTracker:
     ) -> Dict[str, torch.Tensor]:
         """Compute PBS for all public histories.
 
-        PBS(h)[d] = P(deal=d | history=h) ∝ chance(d) * reach_0(d,h) * reach_1(d,h)
+        PBS(h)[d] = P(deal=d | history=h) ~ chance(d) * reach_0(d,h) * reach_1(d,h)
 
         Returns dict: history -> normalized belief tensor [6]
         """
@@ -232,247 +232,3 @@ class BeliefStateTracker:
             values[h] = v
 
         return values
-
-
-class VectorizedCFR:
-    """CFR that operates on belief state tensors directly.
-
-    Instead of traversing one deal at a time, this processes all 6 deals
-    in parallel using PyTorch tensors. This is the computational pattern
-    needed for ReBeL's batch value network training.
-
-    The key insight: at each information set, the strategy is the same
-    for all deals that map to that infoset (same card, same history).
-    But the reach probabilities differ per deal.
-    """
-
-    def __init__(self, device: str = "cpu") -> None:
-        self.game = KuhnPoker()
-        self.device = torch.device(device)
-        self.chance_probs = initial_chance_probs().to(self.device)
-
-        # Regret and strategy accumulators: infoset_key -> [num_actions] tensors
-        self.regret_sum: Dict[str, torch.Tensor] = {}
-        self.strategy_sum: Dict[str, torch.Tensor] = {}
-        self.iteration = 0
-
-        # Terminal values: precomputed [NUM_DEALS] for each terminal history
-        self._terminal_values = self._precompute_terminal_values()
-
-        # Build mappings for vectorized operations
-        self._build_deal_masks()
-
-    def _precompute_terminal_values(self) -> Dict[str, torch.Tensor]:
-        """Precompute terminal utilities for all deals."""
-        values = {}
-        for h in TERMINAL_HISTORIES:
-            v = torch.zeros(NUM_DEALS, device=self.device)
-            for deal_idx, (c0, c1) in enumerate(ALL_DEALS):
-                state = self.game.next_state(self.game.initial_state(), (c0, c1))
-                for action in h:
-                    state = self.game.next_state(state, action)
-                v[deal_idx] = self.game.terminal_utility(state, 0)
-            values[h] = v
-        return values
-
-    def _build_deal_masks(self) -> None:
-        """Build boolean masks mapping cards to deal indices.
-
-        self.card_masks[player][card] is a boolean tensor of shape [NUM_DEALS]
-        that is True for deals where `player` holds `card`.
-        """
-        self.card_masks = {0: {}, 1: {}}
-        for player in (0, 1):
-            for card in CARD_RANKS:
-                mask = torch.zeros(NUM_DEALS, dtype=torch.bool, device=self.device)
-                card_to_deals = CARD_TO_DEALS_P0 if player == 0 else CARD_TO_DEALS_P1
-                for idx in card_to_deals[card]:
-                    mask[idx] = True
-                self.card_masks[player][card] = mask
-
-    def _get_strategy(self, infoset_key: str, num_actions: int) -> torch.Tensor:
-        """Current strategy via regret matching."""
-        if infoset_key not in self.regret_sum:
-            self.regret_sum[infoset_key] = torch.zeros(
-                num_actions, device=self.device
-            )
-            self.strategy_sum[infoset_key] = torch.zeros(
-                num_actions, device=self.device
-            )
-
-        positives = torch.clamp(self.regret_sum[infoset_key], min=0)
-        total = positives.sum()
-        if total > 0:
-            return positives / total
-        return torch.full((num_actions,), 1.0 / num_actions, device=self.device)
-
-    def _expand_strategy_to_deals(
-        self, history: str, player: int, action_idx: int, num_actions: int
-    ) -> torch.Tensor:
-        """Expand infoset strategy to per-deal action probabilities.
-
-        For each deal, look up which card `player` holds, get that
-        infoset's strategy, and return the probability of action_idx.
-
-        Returns: [NUM_DEALS] tensor of action probabilities.
-        """
-        probs = torch.zeros(NUM_DEALS, device=self.device)
-        card_to_deals = CARD_TO_DEALS_P0 if player == 0 else CARD_TO_DEALS_P1
-
-        for card in CARD_RANKS:
-            infoset_key = f"{RANK_NAMES[card]}|{history}"
-            strat = self._get_strategy(infoset_key, num_actions)
-            for deal_idx in card_to_deals[card]:
-                probs[deal_idx] = strat[action_idx]
-
-        return probs
-
-    def _cfr_vectorized(
-        self, history: str, reach_p0: torch.Tensor, reach_p1: torch.Tensor
-    ) -> torch.Tensor:
-        """Vectorized CFR over all deals simultaneously.
-
-        Args:
-            history: public action history
-            reach_p0: [NUM_DEALS] reach probabilities for player 0
-            reach_p1: [NUM_DEALS] reach probabilities for player 1
-
-        Returns: [NUM_DEALS] expected values for player 0
-        """
-        if history in TERMINAL_HISTORIES:
-            return self._terminal_values[history]
-
-        player = len(history) % 2
-        if history in ("", "c"):
-            actions = ["c", "b"]
-        elif history in ("b", "cb"):
-            actions = ["c", "f"]
-        else:
-            return torch.zeros(NUM_DEALS, device=self.device)
-
-        num_actions = len(actions)
-
-        # Compute action values for all deals
-        action_values = []
-        strategy_per_deal = []  # [num_actions, NUM_DEALS]
-
-        for a_idx, action in enumerate(actions):
-            # Get per-deal strategy probabilities
-            s = self._expand_strategy_to_deals(history, player, a_idx, num_actions)
-            strategy_per_deal.append(s)
-
-            # Update reach and recurse
-            child_history = history + action
-            if player == 0:
-                child_values = self._cfr_vectorized(
-                    child_history, reach_p0 * s, reach_p1
-                )
-            else:
-                child_values = self._cfr_vectorized(
-                    child_history, reach_p0, reach_p1 * s
-                )
-            action_values.append(child_values)
-
-        # Stack: [num_actions, NUM_DEALS]
-        action_values_t = torch.stack(action_values)
-        strategy_t = torch.stack(strategy_per_deal)
-
-        # Node value: sum over actions of strategy * action_value, per deal
-        node_values = (strategy_t * action_values_t).sum(dim=0)  # [NUM_DEALS]
-
-        # Update regrets per infoset
-        opponent_reach = reach_p1 if player == 0 else reach_p0
-        player_reach = reach_p0 if player == 0 else reach_p1
-
-        card_to_deals = CARD_TO_DEALS_P0 if player == 0 else CARD_TO_DEALS_P1
-
-        for card in CARD_RANKS:
-            infoset_key = f"{RANK_NAMES[card]}|{history}"
-            strat = self._get_strategy(infoset_key, num_actions)
-
-            # Sum opponent reach over deals where this player has this card
-            deal_indices = card_to_deals[card]
-            mask = self.card_masks[player][card]
-
-            for a_idx in range(num_actions):
-                # Counterfactual regret: weighted by opponent reach
-                # For player 1, values are from P0's perspective so we negate
-                if player == 0:
-                    regret = (
-                        (opponent_reach[mask] * action_values_t[a_idx][mask]).sum()
-                        - (opponent_reach[mask] * node_values[mask]).sum()
-                    )
-                else:
-                    regret = (
-                        (opponent_reach[mask] * node_values[mask]).sum()
-                        - (opponent_reach[mask] * action_values_t[a_idx][mask]).sum()
-                    )
-                self.regret_sum[infoset_key][a_idx] += regret
-
-            # Update strategy sum weighted by player reach
-            total_player_reach = player_reach[mask].sum()
-            self.strategy_sum[infoset_key] += total_player_reach * strat
-
-        return node_values
-
-    def train(self, iterations: int) -> List[float]:
-        """Run vectorized CFR for given iterations.
-
-        Returns exploitability at checkpoints.
-        """
-        exploitabilities = []
-
-        for i in range(iterations):
-            self.iteration += 1
-            # Each deal is weighted by chance probability (1/6 each)
-            # The reach probs start at the chance probability for each deal
-            self._cfr_vectorized("", self.chance_probs.clone(), self.chance_probs.clone())
-
-            if (i + 1) % max(1, iterations // 50) == 0 or i < 10:
-                exp = self._exploitability()
-                exploitabilities.append(exp)
-
-        return exploitabilities
-
-    def average_strategy_profile(self) -> Dict[str, Dict[str, float]]:
-        """Return converged average strategy."""
-        profile = {}
-        for key, strat_sum in self.strategy_sum.items():
-            total = strat_sum.sum()
-            if total > 0:
-                avg = strat_sum / total
-            else:
-                n = len(strat_sum)
-                avg = torch.full((n,), 1.0 / n)
-
-            # Determine actions from history
-            parts = key.split("|")
-            history = parts[1] if len(parts) > 1 else ""
-            if history in ("", "c"):
-                actions = ["c", "b"]
-            else:
-                actions = ["c", "f"]
-
-            profile[key] = {a: avg[i].item() for i, a in enumerate(actions)}
-        return profile
-
-    def _exploitability(self) -> float:
-        """Compute exploitability using the scalar CFR trainer's method."""
-        from kuhn.cfr import CFRTrainer
-        profile = self.average_strategy_profile()
-        dummy = CFRTrainer(self.game)
-        br0 = dummy._best_response_value(profile, 0)
-        br1 = dummy._best_response_value(profile, 1)
-        return 0.5 * (br0 + br1)
-
-    def get_belief_state(self, history: str) -> torch.Tensor:
-        """Get the public belief state at a given history.
-
-        This uses the current strategy to compute reach probabilities
-        and returns the normalized belief over deals.
-        """
-        tracker = BeliefStateTracker(device=str(self.device))
-        profile = self.average_strategy_profile()
-        tracker.set_strategy_from_profile(profile)
-        beliefs = tracker.compute_belief_states()
-        return beliefs.get(history, torch.zeros(NUM_DEALS, device=self.device))
