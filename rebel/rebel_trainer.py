@@ -35,6 +35,7 @@ from kuhn.belief_state import (
     TERMINAL_HISTORIES,
     BeliefStateTracker,
 )
+from cfr.solver import CFRTrainer
 from rebel.value_net import ValueNetwork, train_value_network
 from rebel.data_logger import RebelDataLogger
 
@@ -132,7 +133,6 @@ class RebelTrainer:
 
             # Phase 3: Evaluate
             profile = self._extract_profile()
-            from kuhn.cfr import CFRTrainer
             dummy = CFRTrainer(self.game)
             br0 = dummy._best_response_value(profile, 0)
             br1 = dummy._best_response_value(profile, 1)

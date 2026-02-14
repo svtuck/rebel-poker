@@ -9,8 +9,9 @@ In ReBeL, the endgame solver:
 3. Uses a value network V(PBS) at leaf nodes instead of full rollouts
 4. Returns the solved strategy for the subgame
 
-For Kuhn Poker, the "endgame" is the entire game (it's small enough).
-For larger games (Leduc, NLHE), this becomes essential for real-time play.
+The solver is game-agnostic: it uses the Game protocol to traverse the
+game tree, enumerate chance outcomes, and compute utilities. Any game
+implementing the Game protocol can use this solver.
 
 References:
   - noambrown/poker_solver: River NLHE subgame solver
@@ -25,8 +26,6 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 
 from game_interface import Game
-from kuhn.game import KuhnPoker, RANK_NAMES, CARD_RANKS
-from kuhn.belief_state import ALL_DEALS, NUM_DEALS, CARD_TO_DEALS_P0, CARD_TO_DEALS_P1
 
 
 @dataclass
@@ -41,11 +40,15 @@ class SubgameSolver:
     """Solves a poker subgame from a given PBS using CFR.
 
     This is the core of ReBeL's search procedure. Given:
+    - A game implementing the Game protocol
     - A public belief state (probability over deals)
     - A root history in the game tree
     - Optional: a value function for leaf evaluation
 
     It runs CFR on the subgame and returns the solved strategy.
+
+    The solver discovers game structure (legal actions, terminal states,
+    information sets) dynamically through the Game interface.
     """
 
     def __init__(
@@ -61,10 +64,45 @@ class SubgameSolver:
         self.initial_beliefs = initial_beliefs
         self.value_fn = value_fn
         self.config = config or SubgameConfig()
+        self.num_deals = len(initial_beliefs)
+
+        # Enumerate chance outcomes to build deal -> state mapping
+        initial = game.initial_state()
+        outcomes = game.chance_outcomes(initial)
+        self.all_deals = [deal for deal, _ in outcomes]
+        self._deal_to_idx = {deal: i for i, deal in enumerate(self.all_deals)}
+
+        # Cache infoset -> actions mapping
+        self._infoset_actions: Dict[str, List] = {}
+
+        # Build infoset -> deal indices mapping
+        self._infoset_deal_indices: Dict[str, List[int]] = {}
+        for deal_idx, deal in enumerate(self.all_deals):
+            state = game.next_state(initial, deal)
+            self._build_infoset_map(state, deal_idx)
 
         # Regret and strategy tables for the subgame
         self.regret_sum: Dict[str, torch.Tensor] = {}
         self.strategy_sum: Dict[str, torch.Tensor] = {}
+
+    def _build_infoset_map(self, state, deal_idx: int) -> None:
+        """Recursively traverse to build infoset -> deal mapping."""
+        game = self.game
+        if game.is_terminal(state):
+            return
+        player = game.current_player(state)
+        if player == -1:
+            for outcome, _ in game.chance_outcomes(state):
+                self._build_infoset_map(game.next_state(state, outcome), deal_idx)
+            return
+        key = game.infoset_key(state, player)
+        self._infoset_deal_indices.setdefault(key, [])
+        if deal_idx not in self._infoset_deal_indices[key]:
+            self._infoset_deal_indices[key].append(deal_idx)
+        if key not in self._infoset_actions:
+            self._infoset_actions[key] = game.legal_actions(state)
+        for action in game.legal_actions(state):
+            self._build_infoset_map(game.next_state(state, action), deal_idx)
 
     def _get_strategy(self, key: str, num_actions: int) -> torch.Tensor:
         if key not in self.regret_sum:
@@ -82,63 +120,64 @@ class SubgameSolver:
 
         Returns: {infoset_key: {action: probability}}
         """
+        game = self.game
+        initial = game.initial_state()
+
         for iteration in range(self.config.iterations):
-            # Reach probs weighted by initial beliefs
             reach_p0 = self.initial_beliefs.clone()
             reach_p1 = self.initial_beliefs.clone()
-            self._cfr(self.root_history, reach_p0, reach_p1)
+
+            # Build per-deal states at the root
+            deal_states = [game.next_state(initial, deal) for deal in self.all_deals]
+            self._cfr(deal_states, reach_p0, reach_p1)
 
         return self._extract_profile()
 
     def _cfr(
-        self, history: str, reach_p0: torch.Tensor, reach_p1: torch.Tensor
+        self, states: List, reach_p0: torch.Tensor, reach_p1: torch.Tensor
     ) -> torch.Tensor:
-        """CFR traversal for the subgame. Returns [NUM_DEALS] values."""
-        from kuhn.belief_state import TERMINAL_HISTORIES
+        """CFR traversal for the subgame. Returns [num_deals] values."""
+        game = self.game
 
-        if history in TERMINAL_HISTORIES:
-            # Terminal node: compute payoffs
-            v = torch.zeros(NUM_DEALS)
-            for deal_idx, (c0, c1) in enumerate(ALL_DEALS):
-                state = self.game.next_state(self.game.initial_state(), (c0, c1))
-                for action in history:
-                    state = self.game.next_state(state, action)
-                v[deal_idx] = self.game.terminal_utility(state, 0)
+        # Check if all states are terminal (they should all have same structure)
+        if game.is_terminal(states[0]):
+            v = torch.zeros(self.num_deals)
+            for deal_idx, state in enumerate(states):
+                v[deal_idx] = game.terminal_utility(state, 0)
             return v
 
         # Check if we should use value function for leaf evaluation
-        if self.value_fn is not None and self._is_leaf(history):
+        if self.value_fn is not None and self._is_leaf(states):
             belief = self._compute_belief(reach_p0, reach_p1)
-            return self.value_fn(belief, history)
+            # Use first state's history info for context
+            return self.value_fn(belief, "")
 
-        player = len(history) % 2
-        if history in ("", "c"):
-            actions = ["c", "b"]
-        elif history in ("b", "cb"):
-            actions = ["c", "f"]
-        else:
-            return torch.zeros(NUM_DEALS)
-
+        player = game.current_player(states[0])
+        actions = game.legal_actions(states[0])
         num_actions = len(actions)
+
         action_values = []
         strategy_per_deal = []
 
-        card_to_deals = CARD_TO_DEALS_P0 if player == 0 else CARD_TO_DEALS_P1
+        # Group deals by infoset for this node
+        infoset_deals: Dict[str, List[int]] = {}
+        for d_idx, state in enumerate(states):
+            key = game.infoset_key(state, player)
+            infoset_deals.setdefault(key, []).append(d_idx)
 
         for a_idx, action in enumerate(actions):
-            s = torch.zeros(NUM_DEALS)
-            for card in CARD_RANKS:
-                key = f"{RANK_NAMES[card]}|{history}"
+            s = torch.zeros(self.num_deals)
+            for key, deal_indices in infoset_deals.items():
                 strat = self._get_strategy(key, num_actions)
-                for deal_idx in card_to_deals[card]:
-                    s[deal_idx] = strat[a_idx]
+                for d_idx in deal_indices:
+                    s[d_idx] = strat[a_idx]
             strategy_per_deal.append(s)
 
-            child_history = history + action
+            child_states = [game.next_state(state, action) for state in states]
             if player == 0:
-                child_values = self._cfr(child_history, reach_p0 * s, reach_p1)
+                child_values = self._cfr(child_states, reach_p0 * s, reach_p1)
             else:
-                child_values = self._cfr(child_history, reach_p0, reach_p1 * s)
+                child_values = self._cfr(child_states, reach_p0, reach_p1 * s)
             action_values.append(child_values)
 
         action_values_t = torch.stack(action_values)
@@ -149,16 +188,14 @@ class SubgameSolver:
         opponent_reach = reach_p1 if player == 0 else reach_p0
         player_reach = reach_p0 if player == 0 else reach_p1
 
-        for card in CARD_RANKS:
-            key = f"{RANK_NAMES[card]}|{history}"
+        for key, deal_indices in infoset_deals.items():
             strat = self._get_strategy(key, num_actions)
-            indices = card_to_deals[card]
 
             for a_idx in range(num_actions):
                 # Correct CFR regret: weighted sum of per-deal regrets
-                # regret(I, a) = Σ_{h∈I} opp_reach(h) * (v(h,a) - v(h))
+                # regret(I, a) = sum_{h in I} opp_reach(h) * (v(h,a) - v(h))
                 regret = 0.0
-                for i in indices:
+                for i in deal_indices:
                     if player == 0:
                         regret += opponent_reach[i].item() * (
                             action_values_t[a_idx][i].item() - node_values[i].item()
@@ -170,14 +207,13 @@ class SubgameSolver:
 
                 self.regret_sum[key][a_idx] += regret
 
-            p_r = sum(player_reach[i].item() for i in indices)
+            p_r = sum(player_reach[i].item() for i in deal_indices)
             self.strategy_sum[key] += p_r * strat
 
         return node_values
 
-    def _is_leaf(self, history: str) -> bool:
+    def _is_leaf(self, states: List) -> bool:
         """Check if this node is a leaf for depth-limited solving."""
-        # For Kuhn, no depth limit needed (game is tiny)
         return False
 
     def _compute_belief(
@@ -188,7 +224,7 @@ class SubgameSolver:
         total = joint.sum()
         if total > 0:
             return joint / total
-        return torch.zeros(NUM_DEALS)
+        return torch.zeros(self.num_deals)
 
     def _extract_profile(self) -> Dict[str, Dict[str, float]]:
         """Extract average strategy from accumulated strategy sums."""
@@ -201,12 +237,9 @@ class SubgameSolver:
                 n = len(strat_sum)
                 avg = torch.full((n,), 1.0 / n)
 
-            parts = key.split("|")
-            history = parts[1] if len(parts) > 1 else ""
-            if history in ("", "c"):
-                actions = ["c", "b"]
-            else:
-                actions = ["c", "f"]
+            actions = self._infoset_actions.get(key, [])
+            if not actions:
+                continue
 
             profile[key] = {a: avg[i].item() for i, a in enumerate(actions)}
         return profile

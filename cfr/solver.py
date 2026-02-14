@@ -8,9 +8,6 @@ This implements standard CFR with:
 The solver accepts any game that implements the Game protocol, making it
 usable with Kuhn Poker, Leduc Poker, Liar's Dice, or any other
 imperfect-information game.
-
-The implementation tracks reach probabilities for all card deals simultaneously,
-which is the foundation for public belief state tracking in ReBeL.
 """
 
 from __future__ import annotations
@@ -18,7 +15,6 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 
 from game_interface import Game
-from kuhn.game import KuhnPoker
 
 
 class InfoSet:
@@ -52,11 +48,10 @@ class CFRTrainer:
     """Vanilla CFR solver for any imperfect-information game.
 
     Accepts any game implementing the Game protocol (game_interface.py).
-    Defaults to KuhnPoker if no game is provided.
     """
 
-    def __init__(self, game: Optional[Game] = None) -> None:
-        self.game: Game = game or KuhnPoker()
+    def __init__(self, game: Game) -> None:
+        self.game: Game = game
         self.infosets: Dict[str, InfoSet] = {}
         self.iteration = 0
 
@@ -104,8 +99,6 @@ class CFRTrainer:
             node_util += strategy[idx] * child_util
 
         # Update regrets and strategy sums
-        # Regret = counterfactual_reach * (action_value - node_value)
-        # For player 1, utilities are negated (we compute from P0's perspective)
         opponent_reach = reach_p1 if player == 0 else reach_p0
         player_reach = reach_p0 if player == 0 else reach_p1
 
@@ -113,7 +106,6 @@ class CFRTrainer:
             if player == 0:
                 regret = opponent_reach * (action_utils[idx] - node_util)
             else:
-                # Player 1's utility is -node_util from P0's perspective
                 regret = opponent_reach * (node_util - action_utils[idx])
             infoset.regret_sum[idx] += regret
             infoset.strategy_sum[idx] += player_reach * strategy[idx]
@@ -151,14 +143,9 @@ class CFRTrainer:
     def _best_response_value(
         self, profile: Dict[str, Dict[str, float]], br_player: int
     ) -> float:
-        """Value of best response for br_player against the profile.
-
-        Uses Noam Brown's approach: collect states by infoset, compute
-        the best action per infoset weighted by opponent reach.
-        """
+        """Value of best response for br_player against the profile."""
         game = self.game
 
-        # Phase 1: collect opponent reach to each state and group by infoset
         state_reach: Dict = {}
         infoset_states: Dict[str, List] = {}
         infoset_actions: Dict[str, List] = {}
@@ -188,7 +175,6 @@ class CFRTrainer:
 
         collect(game.initial_state(), 1.0)
 
-        # Phase 2: compute values bottom-up with best response
         value_cache: Dict = {}
         action_cache: Dict[str, str] = {}
 
