@@ -154,14 +154,18 @@ class SubgameSolver:
             indices = card_to_deals[card]
 
             for a_idx in range(num_actions):
-                opp_r = sum(opponent_reach[i].item() for i in indices)
-                act_v = sum(action_values_t[a_idx][i].item() for i in indices)
-                node_v = sum(node_values[i].item() for i in indices)
-
-                if player == 0:
-                    regret = act_v - node_v
-                else:
-                    regret = node_v - act_v
+                # Correct CFR regret: weighted sum of per-deal regrets
+                # regret(I, a) = Σ_{h∈I} opp_reach(h) * (v(h,a) - v(h))
+                regret = 0.0
+                for i in indices:
+                    if player == 0:
+                        regret += opponent_reach[i].item() * (
+                            action_values_t[a_idx][i].item() - node_values[i].item()
+                        )
+                    else:
+                        regret += opponent_reach[i].item() * (
+                            node_values[i].item() - action_values_t[a_idx][i].item()
+                        )
 
                 self.regret_sum[key][a_idx] += regret
 

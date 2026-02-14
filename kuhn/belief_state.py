@@ -419,13 +419,15 @@ class VectorizedCFR:
         """Run vectorized CFR for given iterations.
 
         Returns exploitability at checkpoints.
+
+        Reach probabilities are initialized to the chance probability (1/6)
+        for each deal, which correctly incorporates the chance node's
+        contribution. This means reach[d] = P(chance=d) * P(player actions).
         """
         exploitabilities = []
 
         for i in range(iterations):
             self.iteration += 1
-            # Each deal is weighted by chance probability (1/6 each)
-            # The reach probs start at the chance probability for each deal
             self._cfr_vectorized("", self.chance_probs.clone(), self.chance_probs.clone())
 
             if (i + 1) % max(1, iterations // 50) == 0 or i < 10:

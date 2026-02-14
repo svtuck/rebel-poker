@@ -217,5 +217,85 @@ class TestVectorizedCFR:
                     )
 
 
+class TestSubgameSolver:
+    def test_subgame_converges(self):
+        """Subgame solver should converge to near-Nash when solving full game."""
+        from rebel.endgame_solver import SubgameSolver, SubgameConfig
+        game = KuhnPoker()
+        initial_beliefs = torch.full((6,), 1.0 / 6.0)
+        config = SubgameConfig(iterations=5000)
+        solver = SubgameSolver(game, "", initial_beliefs, config=config)
+        profile = solver.solve()
+
+        # Validate against known Nash properties
+        from kuhn.cfr import CFRTrainer
+        dummy = CFRTrainer(game)
+        br0 = dummy._best_response_value(profile, 0)
+        br1 = dummy._best_response_value(profile, 1)
+        exp = 0.5 * (br0 + br1)
+        assert exp < 0.05, f"Subgame solver exploitability {exp} too high"
+
+    def test_subgame_matches_cfr(self):
+        """Subgame solver should produce similar strategies to full CFR."""
+        from rebel.endgame_solver import SubgameSolver, SubgameConfig
+
+        # Run standard CFR
+        trainer = CFRTrainer()
+        trainer.train(5000)
+        cfr_profile = trainer.average_strategy_profile()
+
+        # Run subgame solver on full game
+        game = KuhnPoker()
+        initial_beliefs = torch.full((6,), 1.0 / 6.0)
+        config = SubgameConfig(iterations=5000)
+        solver = SubgameSolver(game, "", initial_beliefs, config=config)
+        sub_profile = solver.solve()
+
+        # Key infosets should be similar
+        for key in ["K|b", "J|b", "K|c", "J|c"]:
+            if key in cfr_profile and key in sub_profile:
+                for action in cfr_profile[key]:
+                    s = cfr_profile[key][action]
+                    v = sub_profile[key].get(action, 0.5)
+                    assert abs(s - v) < 0.15, (
+                        f"Subgame mismatch at {key}/{action}: cfr={s:.3f}, sub={v:.3f}"
+                    )
+
+
+class TestRebelTrainer:
+    def test_rebel_training_runs(self):
+        """ReBeL training loop should run without errors."""
+        from rebel.rebel_trainer import RebelTrainer
+        trainer = RebelTrainer(
+            value_hidden_dim=32,
+            cfr_iterations=50,
+        )
+        metrics = trainer.train(
+            num_epochs=2,
+            cfr_iters_per_epoch=50,
+            value_train_epochs=10,
+        )
+        assert "value_losses" in metrics
+        assert "exploitabilities" in metrics
+        assert len(metrics["exploitabilities"]) == 2
+
+    def test_rebel_exploitability_bounded(self):
+        """ReBeL should produce a strategy with bounded exploitability."""
+        from rebel.rebel_trainer import RebelTrainer
+        trainer = RebelTrainer(
+            value_hidden_dim=32,
+            cfr_iterations=100,
+        )
+        metrics = trainer.train(
+            num_epochs=3,
+            cfr_iters_per_epoch=100,
+            value_train_epochs=20,
+        )
+        # After training, exploitability should be bounded
+        # (it may not be as tight as pure CFR due to function approximation)
+        final_exp = metrics["exploitabilities"][-1]
+        assert final_exp < 0.5, f"ReBeL exploitability {final_exp} unreasonably high"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
