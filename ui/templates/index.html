@@ -670,32 +670,49 @@
 
         if (!entry) return '<div class="belief-section"><p style="color:var(--text-dim);">No belief data for this node.</p></div>';
 
-        let html = `<div class="belief-section">`;
-        html += `<h3>Public Belief State: P(deal | history = "${history || 'root'}")</h3>`;
+        const pbs = entry.pbs;
+        const cardLabels = beliefData.card_labels || CARDS;
 
-        html += `<div class="belief-grid">`;
-        html += `<div class="belief-cell belief-header">Deal</div>`;
-        for (const dl of DEAL_LABELS) {
-            html += `<div class="belief-cell belief-header">${dl}</div>`;
+        let html = `<div class="belief-section">`;
+        html += `<h3>Public Belief State: P(card | history = "${history || 'root'}")</h3>`;
+
+        // Per-player PBS table
+        html += `<div style="display:grid;grid-template-columns:auto repeat(${cardLabels.length},1fr);gap:2px;font-size:11px;">`;
+        html += `<div class="belief-cell belief-header">Player</div>`;
+        for (const cl of cardLabels) {
+            html += `<div class="belief-cell belief-header">${cl}</div>`;
         }
 
-        html += `<div class="belief-cell belief-label">PBS</div>`;
-        for (let i = 0; i < entry.belief.length; i++) {
-            const b = entry.belief[i];
+        // Player 0 row
+        html += `<div class="belief-cell belief-label" style="color:var(--p0-color)">P0</div>`;
+        for (let i = 0; i < pbs.p0.length; i++) {
+            const b = pbs.p0[i];
             const opacity = Math.min(b * 4, 1).toFixed(2);
-            const bg = `rgba(233, 69, 96, ${opacity})`;
+            const bg = `rgba(79, 195, 247, ${opacity})`;
+            html += `<div class="belief-cell" style="background:${bg}">${(b * 100).toFixed(1)}%</div>`;
+        }
+
+        // Player 1 row
+        html += `<div class="belief-cell belief-label" style="color:var(--p1-color)">P1</div>`;
+        for (let i = 0; i < pbs.p1.length; i++) {
+            const b = pbs.p1[i];
+            const opacity = Math.min(b * 4, 1).toFixed(2);
+            const bg = `rgba(255, 138, 101, ${opacity})`;
             html += `<div class="belief-cell" style="background:${bg}">${(b * 100).toFixed(1)}%</div>`;
         }
         html += `</div>`;
 
-        // Mini bar chart
-        html += `<div style="margin-top:12px;display:flex;height:60px;align-items:flex-end;gap:4px;">`;
-        for (let i = 0; i < entry.belief.length; i++) {
-            const b = entry.belief[i];
-            const h = Math.max(b * 300, 2);
+        // Side-by-side bar chart
+        html += `<div style="margin-top:12px;display:flex;height:60px;align-items:flex-end;gap:8px;">`;
+        for (let i = 0; i < cardLabels.length; i++) {
+            const b0 = pbs.p0[i], b1 = pbs.p1[i];
+            const h0 = Math.max(b0 * 180, 2), h1 = Math.max(b1 * 180, 2);
             html += `<div style="flex:1;display:flex;flex-direction:column;align-items:center;">`;
-            html += `<div style="width:100%;height:${h}px;background:var(--accent);border-radius:2px 2px 0 0;"></div>`;
-            html += `<div style="font-size:9px;color:var(--text-dim);margin-top:2px;">${DEAL_LABELS[i]}</div>`;
+            html += `<div style="display:flex;gap:2px;align-items:flex-end;height:50px;">`;
+            html += `<div style="width:14px;height:${h0}px;background:var(--p0-color);border-radius:2px 2px 0 0;"></div>`;
+            html += `<div style="width:14px;height:${h1}px;background:var(--p1-color);border-radius:2px 2px 0 0;"></div>`;
+            html += `</div>`;
+            html += `<div style="font-size:9px;color:var(--text-dim);margin-top:2px;">${cardLabels[i]}</div>`;
             html += `</div>`;
         }
         html += `</div>`;
@@ -703,9 +720,9 @@
         html += `</div>`;
 
         html += `<div class="pbs-explainer">`;
-        html += `<strong>PBS(h)</strong> = P(deal | history h) proportional to <code>chance(deal) * reach_P0(deal, h) * reach_P1(deal, h)</code><br>`;
-        html += `This is the <strong>public belief state</strong> - what both players (and an observer) can infer about the deal from the action sequence. `;
-        html += `In ReBeL, the value network <code>V(PBS)</code> learns to predict expected payoffs from this belief alone.`;
+        html += `<strong>PBS(h)</strong> = (h, <span style="color:var(--p0-color)">&Delta;(S<sub>0</sub>)</span>, <span style="color:var(--p1-color)">&Delta;(S<sub>1</sub>)</span>) &mdash; per-player belief over private states<br>`;
+        html += `Each column shows the probability that the player holds each card, given the public history. `;
+        html += `In ReBeL, the value network <code>V(PBS)</code> takes this [3,2] tensor as input.`;
         html += `</div>`;
 
         return html;

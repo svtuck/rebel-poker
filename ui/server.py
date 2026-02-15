@@ -21,6 +21,8 @@ from kuhn.belief_state import (
     BeliefStateTracker,
     ALL_DEALS,
     NUM_DEALS,
+    NUM_PRIVATE_STATES,
+    NUM_PLAYERS,
 )
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
@@ -110,12 +112,14 @@ def beliefs():
     belief_data = tracker.compute_belief_states()
     reach_data = tracker.compute_all_reach_probs()
 
+    card_labels = [RANK_NAMES[c] for c in range(NUM_PRIVATE_STATES)]
     deal_labels = [get_deal_label(d) for d in ALL_DEALS]
 
     histories = ["", "c", "b", "cb", "cc", "bc", "bf", "cbc", "cbf"]
     terminal = {"cc", "bc", "bf", "cbc", "cbf"}
 
     result = {
+        "card_labels": card_labels,
         "deal_labels": deal_labels,
         "histories": [],
     }
@@ -124,14 +128,17 @@ def beliefs():
         if h not in belief_data:
             continue
 
-        belief = belief_data[h].tolist()
+        pbs = belief_data[h]  # [NUM_PRIVATE_STATES, NUM_PLAYERS]
         reach_p0, reach_p1 = reach_data[h]
 
         entry = {
             "history": h or "(root)",
             "is_terminal": h in terminal,
             "player": len(h) % 2 if h and h not in terminal else None,
-            "belief": [round(b, 6) for b in belief],
+            "pbs": {
+                "p0": [round(pbs[c, 0].item(), 6) for c in range(NUM_PRIVATE_STATES)],
+                "p1": [round(pbs[c, 1].item(), 6) for c in range(NUM_PRIVATE_STATES)],
+            },
             "reach_p0": [round(r, 6) for r in reach_p0.tolist()],
             "reach_p1": [round(r, 6) for r in reach_p1.tolist()],
         }
@@ -178,20 +185,25 @@ def game_tree():
         }
 
         if history in beliefs:
-            b = beliefs[history]
-            node["belief"] = [round(x, 4) for x in b.tolist()]
+            pbs = beliefs[history]
+            node["pbs"] = {
+                "p0": [round(pbs[c, 0].item(), 4) for c in range(NUM_PRIVATE_STATES)],
+                "p1": [round(pbs[c, 1].item(), 4) for c in range(NUM_PRIVATE_STATES)],
+            }
 
         if is_term:
-            # Add expected payoff weighted by belief
+            # Add expected payoff weighted by joint probability from PBS
             if history in beliefs:
                 game = KuhnPoker()
                 ev_p0 = 0.0
-                b = beliefs[history]
+                pbs = beliefs[history]
                 for deal_idx, (c0, c1) in enumerate(ALL_DEALS):
                     state = game.next_state(game.initial_state(), (c0, c1))
                     for action in history:
                         state = game.next_state(state, action)
-                    ev_p0 += b[deal_idx].item() * game.terminal_utility(state, 0)
+                    # Joint prob from factored PBS
+                    joint_prob = pbs[c0, 0].item() * pbs[c1, 1].item()
+                    ev_p0 += joint_prob * game.terminal_utility(state, 0)
                 node["ev_p0"] = round(ev_p0, 4)
             return node
 

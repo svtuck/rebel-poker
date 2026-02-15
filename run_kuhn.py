@@ -15,6 +15,8 @@ from kuhn.belief_state import (
     BeliefStateTracker,
     ALL_DEALS,
     NUM_DEALS,
+    NUM_PRIVATE_STATES,
+    NUM_PLAYERS,
 )
 from rebel.data_logger import RebelDataLogger
 
@@ -87,20 +89,20 @@ def run_vectorized_cfr(iterations=10000):
 
 
 def display_belief_states(profile):
-    """Display public belief states for all histories."""
-    print_separator("Public Belief States")
+    """Display public belief states (per-player) for all histories."""
+    print_separator("Public Belief States (Per-Player)")
 
     tracker = BeliefStateTracker()
     tracker.set_strategy_from_profile(profile)
     beliefs = tracker.compute_belief_states()
     reaches = tracker.compute_all_reach_probs()
 
-    deal_labels = [format_deal(d) for d in ALL_DEALS]
-    header = "  " + " ".join(f"{dl:>8}" for dl in deal_labels)
-
+    card_labels = [RANK_NAMES[c] for c in range(NUM_PRIVATE_STATES)]
     histories = ["", "c", "b", "cb", "cc", "bc", "bf", "cbc", "cbf"]
 
-    print(f"\n  Deals:  {header}")
+    print(f"\n  PBS[card, player] = P(player holds card | history)")
+    print(f"\n  {'History':<10} | {'Player 0':>20} | {'Player 1':>20}")
+    print(f"  {'':10} | {' '.join(f'{c:>6}' for c in card_labels):>20} | {' '.join(f'{c:>6}' for c in card_labels):>20}")
     print(f"  {'-'*60}")
 
     for h in histories:
@@ -111,10 +113,14 @@ def display_belief_states(profile):
         is_term = h in {"cc", "bc", "bf", "cbc", "cbf"}
         marker = " [T]" if is_term else ""
 
-        vals = " ".join(f"{b[i].item():8.4f}" for i in range(NUM_DEALS))
-        print(f"  {label:<6}{marker:<5} {vals}")
+        p0_vals = " ".join(f"{b[c, 0].item():6.4f}" for c in range(NUM_PRIVATE_STATES))
+        p1_vals = " ".join(f"{b[c, 1].item():6.4f}" for c in range(NUM_PRIVATE_STATES))
+        print(f"  {label:<6}{marker:<4} | {p0_vals:>20} | {p1_vals:>20}")
 
     print(f"\n  Reach Probabilities (Player 0):")
+    deal_labels = [format_deal(d) for d in ALL_DEALS]
+    header = " ".join(f"{dl:>8}" for dl in deal_labels)
+    print(f"  {'':10} {header}")
     for h in histories:
         if h not in reaches:
             continue
@@ -124,6 +130,7 @@ def display_belief_states(profile):
         print(f"  {label:<10} {vals}")
 
     print(f"\n  Reach Probabilities (Player 1):")
+    print(f"  {'':10} {header}")
     for h in histories:
         if h not in reaches:
             continue
