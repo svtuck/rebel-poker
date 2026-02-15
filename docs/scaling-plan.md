@@ -421,7 +421,7 @@ The main GPU win comes at Leduc+ scale when training the value network on larger
 
 1. **Policy network is critical.** The facebookresearch/rebel Issue #25 documents a reimplementation attempt that skipped the policy network and warm-start. Result: value network training error diverged epoch-over-epoch. The policy network reduces the number of CFR iterations needed per subgame solve. ([GitHub Issue #25](https://github.com/facebookresearch/rebel/issues/25))
 
-2. **C++ for data generation, Python for training.** Both the official ReBeL code and noambrown/poker_solver use this split. CFR tree traversal is performance-critical; neural network training uses standard PyTorch. For Kuhn and Leduc, Python-only is fine.
+2. **Rust for data generation, Python for training.** Both the official ReBeL code and noambrown/poker_solver use a native/Python split (C++ in their case). CFR tree traversal is performance-critical; neural network training uses standard PyTorch. For Kuhn and Leduc, Python-only is fine. Our native backend will use Rust with pyo3 bindings.
 
 3. **Start with tabular CFR as ground truth.** OpenSpiel's approach of having exact tabular solvers alongside approximate methods is valuable. Always verify the neural network approach against the tabular solution.
 
