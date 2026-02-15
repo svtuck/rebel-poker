@@ -1,20 +1,33 @@
-"""Vanilla CFR (Counterfactual Regret Minimization).
+"""CFR solver with multiple algorithm variants.
 
-This implements standard CFR with:
-- Regret matching for strategy computation
-- Reach-weighted strategy accumulation for average strategy
-- Exploitability computation via best response
+Supports:
+- Vanilla CFR
+- CFR+ (regret clipping, optional linear weighting)
+- DCFR (discounted CFR with per-iteration decay)
+- Alternating updates (separate traversal per player per iteration)
 
 The solver accepts any game that implements the Game protocol, making it
-usable with Kuhn Poker, Leduc Poker, Liar's Dice, or any other
-imperfect-information game.
+usable with Kuhn Poker, Leduc Poker, or any other imperfect-information game.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from math import pow
 from typing import Dict, List, Optional
 
 from game_interface import Game
+
+
+@dataclass
+class CFRConfig:
+    use_plus: bool = False
+    linear_weighting: bool = False
+    alternating: bool = False
+    use_dcfr: bool = False
+    dcfr_alpha: float = 1.5
+    dcfr_beta: float = 0.0
+    dcfr_gamma: float = 2.0
 
 
 class InfoSet:
@@ -25,6 +38,7 @@ class InfoSet:
         n = len(actions)
         self.regret_sum = [0.0] * n
         self.strategy_sum = [0.0] * n
+        self.last_dcfr_iter = 0
 
     def current_strategy(self) -> List[float]:
         """Regret-matching: normalize positive regrets."""
@@ -43,42 +57,94 @@ class InfoSet:
         n = len(self.actions)
         return [1.0 / n] * n
 
+    def apply_dcfr_discount(self, iteration: int, alpha: float, beta: float, gamma: float) -> None:
+        if self.last_dcfr_iter == iteration:
+            return
+        for t in range(self.last_dcfr_iter + 1, iteration + 1):
+            pos_base = pow(float(t), alpha)
+            neg_base = pow(float(t), beta)
+            pos_scale = pos_base / (pos_base + 1.0)
+            neg_scale = neg_base / (neg_base + 1.0)
+            strat_scale = pow(float(t) / (float(t) + 1.0), gamma)
+            for idx, regret in enumerate(self.regret_sum):
+                if regret > 0.0:
+                    self.regret_sum[idx] = regret * pos_scale
+                elif regret < 0.0:
+                    self.regret_sum[idx] = regret * neg_scale
+            for idx, value in enumerate(self.strategy_sum):
+                self.strategy_sum[idx] = value * strat_scale
+        self.last_dcfr_iter = iteration
+
 
 class CFRTrainer:
-    """Vanilla CFR solver for any imperfect-information game.
+    """CFR solver for any imperfect-information game.
 
     Accepts any game implementing the Game protocol (game_interface.py).
+    Supports vanilla CFR, CFR+, DCFR, and alternating updates via CFRConfig.
     """
 
-    def __init__(self, game: Game) -> None:
+    def __init__(self, game: Game, config: Optional[CFRConfig] = None) -> None:
         self.game: Game = game
+        self.config = config or CFRConfig()
         self.infosets: Dict[str, InfoSet] = {}
         self.iteration = 0
+        self._pending_regret: Dict[str, List[float]] = {}
 
     def _get_infoset(self, state, player: int) -> tuple[str, InfoSet]:
         key = self.game.infoset_key(state, player)
-        if key not in self.infosets:
+        infoset = self.infosets.get(key)
+        if infoset is None:
             actions = self.game.legal_actions(state)
-            self.infosets[key] = InfoSet(actions)
-        return key, self.infosets[key]
+            infoset = InfoSet(actions)
+            self.infosets[key] = infoset
+        return key, infoset
 
-    def _cfr(self, state, reach_p0: float, reach_p1: float) -> float:
+    def _accumulate_regret(self, key: str, infoset: InfoSet, deltas: List[float]) -> None:
+        if not self.config.use_plus:
+            for idx, delta in enumerate(deltas):
+                infoset.regret_sum[idx] += delta
+            return
+
+        pending = self._pending_regret.get(key)
+        if pending is None:
+            pending = [0.0 for _ in infoset.actions]
+        for idx, delta in enumerate(deltas):
+            pending[idx] += delta
+        self._pending_regret[key] = pending
+
+    def _apply_regret_updates(self) -> None:
+        if not self.config.use_plus:
+            return
+        for key, deltas in self._pending_regret.items():
+            infoset = self.infosets[key]
+            for idx, delta in enumerate(deltas):
+                infoset.regret_sum[idx] = max(0.0, infoset.regret_sum[idx] + delta)
+        self._pending_regret.clear()
+
+    def _cfr(self, state, reach_p0: float, reach_p1: float,
+             update_player: Optional[int] = None) -> float:
         """Recursive CFR traversal. Returns expected value for player 0."""
         if self.game.is_terminal(state):
             return self.game.terminal_utility(state, 0)
 
         if self.game.current_player(state) == -1:
-            # Chance node
             value = 0.0
             for outcome, prob in self.game.chance_outcomes(state):
                 value += prob * self._cfr(
                     self.game.next_state(state, outcome),
-                    reach_p0, reach_p1
+                    reach_p0, reach_p1, update_player
                 )
             return value
 
         player = self.game.current_player(state)
         key, infoset = self._get_infoset(state, player)
+        if self.config.use_dcfr and (update_player is None or update_player == player):
+            infoset.apply_dcfr_discount(
+                self.iteration,
+                self.config.dcfr_alpha,
+                self.config.dcfr_beta,
+                self.config.dcfr_gamma,
+            )
         strategy = infoset.current_strategy()
         actions = infoset.actions
 
@@ -88,29 +154,48 @@ class CFRTrainer:
             if player == 0:
                 child_util = self._cfr(
                     self.game.next_state(state, action),
-                    reach_p0 * strategy[idx], reach_p1
+                    reach_p0 * strategy[idx], reach_p1, update_player
                 )
             else:
                 child_util = self._cfr(
                     self.game.next_state(state, action),
-                    reach_p0, reach_p1 * strategy[idx]
+                    reach_p0, reach_p1 * strategy[idx], update_player
                 )
             action_utils.append(child_util)
             node_util += strategy[idx] * child_util
 
-        # Update regrets and strategy sums
-        opponent_reach = reach_p1 if player == 0 else reach_p0
-        player_reach = reach_p0 if player == 0 else reach_p1
-
-        for idx in range(len(actions)):
+        if update_player is None or update_player == player:
             if player == 0:
-                regret = opponent_reach * (action_utils[idx] - node_util)
+                opponent_reach = reach_p1
+                deltas = [opponent_reach * (u - node_util) for u in action_utils]
             else:
-                regret = opponent_reach * (node_util - action_utils[idx])
-            infoset.regret_sum[idx] += regret
-            infoset.strategy_sum[idx] += player_reach * strategy[idx]
+                opponent_reach = reach_p0
+                deltas = [opponent_reach * (node_util - u) for u in action_utils]
+            self._accumulate_regret(key, infoset, deltas)
+
+            weight = reach_p0 if player == 0 else reach_p1
+            if self.config.use_plus and self.config.linear_weighting and not self.config.use_dcfr:
+                weight *= self.iteration
+            for idx in range(len(actions)):
+                infoset.strategy_sum[idx] += weight * strategy[idx]
 
         return node_util
+
+    def run(self, iterations: int) -> None:
+        """Run CFR for the given number of iterations (no exploitability tracking)."""
+        for _ in range(iterations):
+            self.iteration += 1
+            if self.config.alternating:
+                self._pending_regret.clear()
+                self._cfr(self.game.initial_state(), 1.0, 1.0, update_player=0)
+                self._apply_regret_updates()
+                self._pending_regret.clear()
+                self._cfr(self.game.initial_state(), 1.0, 1.0, update_player=1)
+                self._apply_regret_updates()
+            else:
+                self._pending_regret.clear()
+                self._cfr(self.game.initial_state(), 1.0, 1.0, update_player=None)
+                self._apply_regret_updates()
 
     def train(self, iterations: int) -> List[float]:
         """Run CFR for the given number of iterations.
@@ -120,7 +205,17 @@ class CFRTrainer:
         exploitabilities = []
         for _ in range(iterations):
             self.iteration += 1
-            self._cfr(self.game.initial_state(), 1.0, 1.0)
+            if self.config.alternating:
+                self._pending_regret.clear()
+                self._cfr(self.game.initial_state(), 1.0, 1.0, update_player=0)
+                self._apply_regret_updates()
+                self._pending_regret.clear()
+                self._cfr(self.game.initial_state(), 1.0, 1.0, update_player=1)
+                self._apply_regret_updates()
+            else:
+                self._pending_regret.clear()
+                self._cfr(self.game.initial_state(), 1.0, 1.0, update_player=None)
+                self._apply_regret_updates()
             if self.iteration % max(1, iterations // 100) == 0 or self.iteration <= 10:
                 exploitabilities.append(self.exploitability())
         return exploitabilities
