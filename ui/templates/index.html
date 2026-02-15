@@ -582,6 +582,9 @@
 
     function renderStrategySection(history, node, player) {
         const actions = getActionLabels(history);
+        const handEvs = node.hand_evs || {};
+        const actingPlayerKey = player === 0 ? "p0" : "p1";
+
         let html = `<div class="strategy-section">`;
         html += `<h3>Strategy at "${history || 'Root'}" (Player ${player})</h3>`;
 
@@ -618,10 +621,106 @@
             }
             html += `</div>`;
 
-            // EV placeholder
-            html += `<div class="ev-text ev-zero">--</div>`;
+            // EV for the acting player holding this card
+            const playerEvs = handEvs[actingPlayerKey];
+            if (playerEvs && playerEvs[card] !== undefined) {
+                const ev = playerEvs[card];
+                const cls = ev > 0.001 ? "ev-pos" : ev < -0.001 ? "ev-neg" : "ev-zero";
+                html += `<div class="ev-text ${cls}">${ev >= 0 ? "+" : ""}${ev.toFixed(3)}</div>`;
+            } else {
+                html += `<div class="ev-text ev-zero">--</div>`;
+            }
             html += `</div>`;
         }
+
+        html += `</div>`;
+
+        // Per-Hand EVs for both players
+        html += renderHandEvsSection(node);
+
+        // Deal Probabilities
+        html += renderDealProbsSection(node);
+
+        return html;
+    }
+
+    function renderHandEvsSection(node) {
+        const handEvs = node.hand_evs;
+        if (!handEvs || (!Object.keys(handEvs.p0 || {}).length && !Object.keys(handEvs.p1 || {}).length)) {
+            return '';
+        }
+
+        let html = `<div class="strategy-section">`;
+        html += `<h3>Per-Hand Expected Values</h3>`;
+
+        html += `<div style="display:grid;grid-template-columns:auto repeat(3,1fr);gap:2px;font-size:11px;">`;
+        html += `<div class="belief-cell belief-header">Player</div>`;
+        for (const c of CARDS) {
+            html += `<div class="belief-cell belief-header">${c}</div>`;
+        }
+
+        // P0 row
+        html += `<div class="belief-cell belief-label" style="color:var(--p0-color)">P0</div>`;
+        for (const c of CARDS) {
+            const ev = (handEvs.p0 || {})[c];
+            if (ev !== undefined) {
+                const cls = ev > 0.001 ? "ev-pos" : ev < -0.001 ? "ev-neg" : "ev-zero";
+                html += `<div class="belief-cell ${cls}" style="font-weight:bold;">${ev >= 0 ? "+" : ""}${ev.toFixed(4)}</div>`;
+            } else {
+                html += `<div class="belief-cell ev-zero">--</div>`;
+            }
+        }
+
+        // P1 row
+        html += `<div class="belief-cell belief-label" style="color:var(--p1-color)">P1</div>`;
+        for (const c of CARDS) {
+            const ev = (handEvs.p1 || {})[c];
+            if (ev !== undefined) {
+                const cls = ev > 0.001 ? "ev-pos" : ev < -0.001 ? "ev-neg" : "ev-zero";
+                html += `<div class="belief-cell ${cls}" style="font-weight:bold;">${ev >= 0 ? "+" : ""}${ev.toFixed(4)}</div>`;
+            } else {
+                html += `<div class="belief-cell ev-zero">--</div>`;
+            }
+        }
+        html += `</div>`;
+
+        html += `<div style="margin-top:8px;font-size:10px;color:var(--text-dim);">`;
+        html += `EV of holding each card at this node (from that player's perspective). Zero-sum: P0 gain = P1 loss.`;
+        html += `</div>`;
+
+        html += `</div>`;
+        return html;
+    }
+
+    function renderDealProbsSection(node) {
+        const dealProbs = node.deal_probs;
+        if (!dealProbs || dealProbs.length === 0) return '';
+
+        let html = `<div class="strategy-section">`;
+        html += `<h3>Deal Probabilities (Most Likely)</h3>`;
+
+        const maxProb = dealProbs[0].prob;
+
+        for (const dp of dealProbs) {
+            const pct = (dp.prob * 100).toFixed(1);
+            const barW = (dp.prob / maxProb * 100).toFixed(1);
+            const c0 = dp.deal[0], c1 = dp.deal[1];
+
+            html += `<div style="display:grid;grid-template-columns:60px 1fr 60px;align-items:center;gap:8px;padding:4px 0;">`;
+            html += `<div style="display:flex;gap:4px;">`;
+            html += `<span class="card ${cardClass(c0)}" style="width:22px;height:28px;font-size:12px;">${c0}</span>`;
+            html += `<span class="card ${cardClass(c1)}" style="width:22px;height:28px;font-size:12px;">${c1}</span>`;
+            html += `</div>`;
+            html += `<div style="height:18px;background:var(--surface2);border-radius:3px;overflow:hidden;">`;
+            html += `<div style="width:${barW}%;height:100%;background:var(--accent2);border-radius:3px;"></div>`;
+            html += `</div>`;
+            html += `<div style="font-size:11px;text-align:right;color:var(--text-dim);">${pct}%</div>`;
+            html += `</div>`;
+        }
+
+        html += `<div style="margin-top:8px;font-size:10px;color:var(--text-dim);">`;
+        html += `Joint probability of each deal given the public history. Computed from reach probabilities.`;
+        html += `</div>`;
 
         html += `</div>`;
         return html;

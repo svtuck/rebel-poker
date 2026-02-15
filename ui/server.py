@@ -20,6 +20,8 @@ from cfr.vectorized import VectorizedCFR
 from kuhn.belief_state import (
     BeliefStateTracker,
     ALL_DEALS,
+    CARD_TO_DEALS_P0,
+    CARD_TO_DEALS_P1,
     NUM_DEALS,
     NUM_PRIVATE_STATES,
     NUM_PLAYERS,
@@ -171,12 +173,27 @@ def game_tree():
     profile = solver_state["profile"]
     tracker = solver_state["tracker"]
     beliefs = tracker.compute_belief_states()
+    reach_data = tracker.compute_all_reach_probs()
 
     terminal = {"cc", "bc", "bf", "cbc", "cbf"}
+    game = KuhnPoker()
+
+    # Precompute terminal utilities for all deals at all terminal histories
+    terminal_utils = {}  # history -> [NUM_DEALS] utilities from P0's perspective
+    for h in terminal:
+        utils = []
+        for deal_idx, (c0, c1) in enumerate(ALL_DEALS):
+            state = game.next_state(game.initial_state(), (c0, c1))
+            for action in h:
+                state = game.next_state(state, action)
+            utils.append(game.terminal_utility(state, 0))
+        terminal_utils[h] = utils
 
     def build_node(history):
+        """Build tree node. Returns (node_dict, deal_evs) where deal_evs[d] is
+        the EV from P0's perspective for deal d at this node."""
         is_term = history in terminal
-        player = len(history) % 2 if history and not is_term else None
+        player = None if is_term else len(history) % 2
 
         node = {
             "history": history or "(root)",
@@ -184,6 +201,7 @@ def game_tree():
             "player": player,
         }
 
+        # Add PBS
         if history in beliefs:
             pbs = beliefs[history]
             node["pbs"] = {
@@ -191,29 +209,41 @@ def game_tree():
                 "p1": [round(pbs[c, 1].item(), 4) for c in range(NUM_PRIVATE_STATES)],
             }
 
-        if is_term:
-            # Add expected payoff weighted by joint probability from PBS
-            if history in beliefs:
-                game = KuhnPoker()
-                ev_p0 = 0.0
-                pbs = beliefs[history]
-                for deal_idx, (c0, c1) in enumerate(ALL_DEALS):
-                    state = game.next_state(game.initial_state(), (c0, c1))
-                    for action in history:
-                        state = game.next_state(state, action)
-                    # Joint prob from factored PBS
-                    joint_prob = pbs[c0, 0].item() * pbs[c1, 1].item()
-                    ev_p0 += joint_prob * game.terminal_utility(state, 0)
-                node["ev_p0"] = round(ev_p0, 4)
-            return node
+        # Add deal probabilities (joint, from reach probs)
+        if history in reach_data:
+            reach_p0, reach_p1 = reach_data[history]
+            chance = 1.0 / NUM_DEALS
+            joint = [(reach_p0[d].item() * reach_p1[d].item() * chance)
+                     for d in range(NUM_DEALS)]
+            total = sum(joint)
+            if total > 0:
+                deal_probs = [(d, joint[d] / total) for d in range(NUM_DEALS)]
+                # Sort by probability descending
+                deal_probs.sort(key=lambda x: -x[1])
+                node["deal_probs"] = [
+                    {"deal": get_deal_label(ALL_DEALS[d]), "prob": round(p, 6)}
+                    for d, p in deal_probs if p > 1e-8
+                ]
 
-        # Add children
+        if is_term:
+            deal_evs = terminal_utils[history]
+            # Overall EV weighted by joint probability
+            if history in beliefs:
+                pbs = beliefs[history]
+                ev_p0 = 0.0
+                for deal_idx, (c0, c1) in enumerate(ALL_DEALS):
+                    joint_prob = pbs[c0, 0].item() * pbs[c1, 1].item()
+                    ev_p0 += joint_prob * deal_evs[deal_idx]
+                node["ev_p0"] = round(ev_p0, 4)
+            return node, deal_evs
+
+        # Determine actions
         if history in ("", "c"):
             actions = [("c", "Check"), ("b", "Bet")]
         elif history in ("b", "cb"):
             actions = [("c", "Call"), ("f", "Fold")]
         else:
-            return node
+            return node, [0.0] * NUM_DEALS
 
         # Add strategy info for this node
         strategies = {}
@@ -227,18 +257,71 @@ def game_tree():
                 }
         node["strategies"] = strategies
 
+        # Build children and compute deal-level EVs
         children = []
+        child_deal_evs = {}  # action_code -> [NUM_DEALS] evs
         for action, label in actions:
             child_history = history + action
-            child = build_node(child_history)
+            child, child_evs = build_node(child_history)
             child["action"] = label
             child["action_code"] = action
             children.append(child)
+            child_deal_evs[action] = child_evs
         node["children"] = children
 
-        return node
+        # Compute per-deal EV at this decision node:
+        # EV(deal d) = sum_a strategy(card_of_acting_player(d), a) * child_EV(a, d)
+        card_to_deals = CARD_TO_DEALS_P0 if player == 0 else CARD_TO_DEALS_P1
 
-    tree = build_node("")
+        deal_evs = [0.0] * NUM_DEALS
+        for card in range(3):
+            card_name = RANK_NAMES[card]
+            key = f"{card_name}|{history}"
+            strat = profile.get(key, {})
+            for deal_idx in card_to_deals[card]:
+                ev = 0.0
+                for action_code, _ in actions:
+                    action_prob = strat.get(action_code, 1.0 / len(actions))
+                    ev += action_prob * child_deal_evs[action_code][deal_idx]
+                deal_evs[deal_idx] = ev
+
+        # Compute per-hand EVs for both players
+        # For each player, for each card they could hold, average the deal EVs
+        # weighted by conditional probability of opponent's card
+        hand_evs = {"p0": {}, "p1": {}}
+        if history in reach_data:
+            reach_p0, reach_p1 = reach_data[history]
+            chance = 1.0 / NUM_DEALS
+            for card in range(3):
+                card_name = RANK_NAMES[card]
+                # P0 holding this card: deals where c0 == card
+                p0_deals = CARD_TO_DEALS_P0[card]
+                weight_sum = 0.0
+                ev_sum = 0.0
+                for d in p0_deals:
+                    w = reach_p0[d].item() * reach_p1[d].item() * chance
+                    weight_sum += w
+                    ev_sum += w * deal_evs[d]
+                if weight_sum > 1e-10:
+                    hand_evs["p0"][card_name] = round(ev_sum / weight_sum, 4)
+
+                # P1 holding this card: deals where c1 == card
+                p1_deals = CARD_TO_DEALS_P1[card]
+                weight_sum = 0.0
+                ev_sum = 0.0
+                for d in p1_deals:
+                    w = reach_p0[d].item() * reach_p1[d].item() * chance
+                    weight_sum += w
+                    # P1's EV is negative of P0's EV (zero-sum)
+                    ev_sum += w * (-deal_evs[d])
+                if weight_sum > 1e-10:
+                    hand_evs["p1"][card_name] = round(ev_sum / weight_sum, 4)
+
+        node["hand_evs"] = hand_evs
+
+        return node, deal_evs
+
+    tree, _ = build_node("")
     return jsonify(tree)
 
 
