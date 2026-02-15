@@ -7,6 +7,10 @@ computational pattern needed for ReBeL's batch value network training.
 The solver is game-agnostic: it uses the Game protocol to enumerate
 chance outcomes, legal actions, and information sets. Any game that
 implements Game can use this solver.
+
+Handles mid-tree chance nodes (e.g., Leduc board card deal) by expanding
+each deal's chance outcomes into child states, recursing over the expanded
+set, and contracting back via probability-weighted averaging.
 """
 
 from __future__ import annotations
@@ -27,7 +31,9 @@ class VectorizedCFR:
     probabilities differ per deal.
 
     This solver discovers the game structure by traversing from the
-    initial state, so it works with any Game implementation.
+    initial state, so it works with any Game implementation. Mid-tree
+    chance nodes (like Leduc's board card deal) are handled by expanding
+    over outcomes weighted by probability.
     """
 
     def __init__(self, game: Game, device: str = "cpu") -> None:
@@ -78,7 +84,7 @@ class VectorizedCFR:
             return
         player = game.current_player(state)
         if player == -1:
-            # Nested chance node (unusual but possible)
+            # Mid-tree chance node (e.g., Leduc board card deal)
             for outcome, _ in game.chance_outcomes(state):
                 self._traverse_for_mapping(game.next_state(state, outcome), deal_idx)
             return
@@ -113,42 +119,43 @@ class VectorizedCFR:
         """Vectorized CFR over all deals simultaneously.
 
         Args:
-            states: list of states, one per deal (parallel game trees)
-            reach_p0: [num_deals] reach probabilities for player 0
-            reach_p1: [num_deals] reach probabilities for player 1
+            states: list of N states (parallel game trees)
+            reach_p0: [N] reach probabilities for player 0
+            reach_p1: [N] reach probabilities for player 1
 
-        Returns: [num_deals] expected values for player 0
+        Returns: [N] expected values for player 0
         """
         game = self.game
+        n = len(states)
 
         # Check if all states are terminal
         if game.is_terminal(states[0]):
-            # Cache terminal values
-            state_key = tuple(id(s) if not isinstance(s, (int, str, tuple)) else s for s in states)
-            values = torch.zeros(self.num_deals, device=self.device)
-            for d_idx, state in enumerate(states):
-                values[d_idx] = game.terminal_utility(state, 0)
+            values = torch.zeros(n, device=self.device)
+            for i, state in enumerate(states):
+                values[i] = game.terminal_utility(state, 0)
             return values
 
         player = game.current_player(states[0])
+
+        # Handle mid-tree chance nodes by expanding over outcomes
+        if player == -1:
+            return self._handle_chance_node(states, reach_p0, reach_p1)
+
         actions = game.legal_actions(states[0])
         num_actions = len(actions)
 
         # Build per-deal strategy probabilities for each action
-        # Group deals by infoset to get shared strategy
         action_values = []
         strategy_per_deal = []
 
         for a_idx, action in enumerate(actions):
-            # For each deal, find which infoset it belongs to and get strategy prob
-            s = torch.zeros(self.num_deals, device=self.device)
-            for d_idx, state in enumerate(states):
+            s = torch.zeros(n, device=self.device)
+            for i, state in enumerate(states):
                 key = game.infoset_key(state, player)
                 strat = self._get_strategy(key, num_actions)
-                s[d_idx] = strat[a_idx]
+                s[i] = strat[a_idx]
             strategy_per_deal.append(s)
 
-            # Recurse with updated reach probabilities
             child_states = [game.next_state(state, action) for state in states]
             if player == 0:
                 child_values = self._cfr_vectorized(
@@ -160,25 +167,25 @@ class VectorizedCFR:
                 )
             action_values.append(child_values)
 
-        action_values_t = torch.stack(action_values)  # [num_actions, num_deals]
-        strategy_t = torch.stack(strategy_per_deal)    # [num_actions, num_deals]
+        action_values_t = torch.stack(action_values)  # [num_actions, N]
+        strategy_t = torch.stack(strategy_per_deal)    # [num_actions, N]
 
         # Node value: weighted sum of action values
-        node_values = (strategy_t * action_values_t).sum(dim=0)  # [num_deals]
+        node_values = (strategy_t * action_values_t).sum(dim=0)  # [N]
 
         # Update regrets per infoset
         opponent_reach = reach_p1 if player == 0 else reach_p0
         player_reach = reach_p0 if player == 0 else reach_p1
 
-        # Group deals by infoset for efficient regret updates
-        infoset_deals: Dict[str, List[int]] = {}
-        for d_idx, state in enumerate(states):
+        # Group states by infoset for efficient regret updates
+        infoset_local_indices: Dict[str, List[int]] = {}
+        for i, state in enumerate(states):
             key = game.infoset_key(state, player)
-            infoset_deals.setdefault(key, []).append(d_idx)
+            infoset_local_indices.setdefault(key, []).append(i)
 
-        for key, deal_indices in infoset_deals.items():
+        for key, local_indices in infoset_local_indices.items():
             strat = self._get_strategy(key, num_actions)
-            idx_tensor = torch.tensor(deal_indices, device=self.device, dtype=torch.long)
+            idx_tensor = torch.tensor(local_indices, device=self.device, dtype=torch.long)
 
             for a_idx in range(num_actions):
                 if player == 0:
@@ -197,6 +204,56 @@ class VectorizedCFR:
             self.strategy_sum[key] += total_player_reach * strat
 
         return node_values
+
+    def _handle_chance_node(
+        self,
+        states: List,
+        reach_p0: torch.Tensor,
+        reach_p1: torch.Tensor,
+    ) -> torch.Tensor:
+        """Handle mid-tree chance nodes by expanding over outcomes.
+
+        For each state, enumerates chance outcomes and recurses with the
+        expanded state set. Values are contracted back via probability-weighted
+        averaging. Reach probabilities pass through unchanged, matching
+        scalar CFR semantics where chance probability only weights the
+        returned value.
+        """
+        game = self.game
+        n = len(states)
+
+        # Build expanded states: for each original state, enumerate outcomes
+        expanded_states: List = []
+        expanded_reach_p0_list: List[float] = []
+        expanded_reach_p1_list: List[float] = []
+        # Track (original_idx, chance_prob) per expanded entry for contraction
+        expansion_map: List[Tuple[int, float]] = []
+
+        for i, state in enumerate(states):
+            for outcome, prob in game.chance_outcomes(state):
+                child = game.next_state(state, outcome)
+                expanded_states.append(child)
+                expanded_reach_p0_list.append(reach_p0[i].item())
+                expanded_reach_p1_list.append(reach_p1[i].item())
+                expansion_map.append((i, prob))
+
+        exp_reach_p0 = torch.tensor(
+            expanded_reach_p0_list, device=self.device, dtype=torch.float32
+        )
+        exp_reach_p1 = torch.tensor(
+            expanded_reach_p1_list, device=self.device, dtype=torch.float32
+        )
+
+        expanded_values = self._cfr_vectorized(
+            expanded_states, exp_reach_p0, exp_reach_p1
+        )
+
+        # Contract: probability-weighted sum back to original indices
+        values = torch.zeros(n, device=self.device)
+        for j, (orig_idx, prob) in enumerate(expansion_map):
+            values[orig_idx] += prob * expanded_values[j]
+
+        return values
 
     def train(self, iterations: int) -> List[float]:
         """Run vectorized CFR for given iterations.
