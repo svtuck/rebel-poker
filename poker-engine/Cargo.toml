@@ -1,0 +1,26 @@
+[package]
+name = "poker-engine"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "poker_engine"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["pyo3-bindings"]
+pyo3-bindings = ["pyo3"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "hand_eval"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = true
