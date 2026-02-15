@@ -32,12 +32,39 @@ from kuhn.belief_state import (
     CARD_TO_DEALS_P0,
     CARD_TO_DEALS_P1,
     NUM_DEALS,
+    NUM_PLAYERS,
+    NUM_PRIVATE_STATES,
     TERMINAL_HISTORIES,
     BeliefStateTracker,
+    reach_to_pbs,
 )
 from cfr.solver import CFRTrainer
 from rebel.value_net import ValueNetwork, train_value_network
 from rebel.data_logger import RebelDataLogger
+
+
+def deal_values_to_pbs_values(
+    node_values: torch.Tensor,
+) -> torch.Tensor:
+    """Convert per-deal values [NUM_DEALS] to per-private-state values [NUM_PRIVATE_STATES, NUM_PLAYERS].
+
+    For each (card, player), averages the value across all deals where
+    that player holds that card.
+    """
+    pbs_values = torch.zeros(NUM_PRIVATE_STATES, NUM_PLAYERS, device=node_values.device)
+
+    for card in CARD_RANKS:
+        # Player 0's value when holding this card
+        p0_indices = CARD_TO_DEALS_P0[card]
+        if p0_indices:
+            pbs_values[card, 0] = sum(node_values[i] for i in p0_indices) / len(p0_indices)
+
+        # Player 1's value (negated, since values are from P0's perspective)
+        p1_indices = CARD_TO_DEALS_P1[card]
+        if p1_indices:
+            pbs_values[card, 1] = sum(-node_values[i] for i in p1_indices) / len(p1_indices)
+
+    return pbs_values
 
 
 class RebelTrainer:
@@ -198,7 +225,8 @@ class RebelTrainer:
         joint = reach_p0 * reach_p1
         total = joint.sum()
         if total > 0:
-            belief = joint / total
+            belief = reach_to_pbs(reach_p0, reach_p1, device=str(self.device))
+            pbs_values = deal_values_to_pbs_values(node_values)
             strategy_dict = {}
             for card in CARD_RANKS:
                 key = f"{RANK_NAMES[card]}|{history}"
@@ -210,7 +238,7 @@ class RebelTrainer:
                 reach_p0=reach_p0,
                 reach_p1=reach_p1,
                 strategy=strategy_dict,
-                values_p0=node_values,
+                values=pbs_values,
                 iteration=iteration,
             )
 

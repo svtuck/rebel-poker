@@ -9,12 +9,14 @@ value and policy networks:
 4. The reach probabilities that produced the PBS
 
 This data can then be used to train:
-  - V(PBS) -> expected value for each player given the belief state
-  - π(PBS) -> policy (action probabilities) given the belief state
+  - V(PBS) -> expected value for each private state per player
+  - pi(PBS) -> policy (action probabilities) given the belief state
 
 The key ReBeL insight: instead of training on information states,
 we train on public belief states. This allows the value network
 to generalize across different private information configurations.
+
+PBS is represented as [NUM_PRIVATE_STATES, NUM_PLAYERS] = [3, 2] for Kuhn.
 """
 
 from __future__ import annotations
@@ -24,6 +26,8 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from kuhn.belief_state import NUM_PRIVATE_STATES, NUM_PLAYERS
+
 
 @dataclass
 class PBSDataPoint:
@@ -31,11 +35,11 @@ class PBSDataPoint:
 
     Attributes:
         history: public action history string
-        belief: [NUM_DEALS] PBS tensor
+        belief: [NUM_PRIVATE_STATES, NUM_PLAYERS] factored PBS tensor
         reach_p0: [NUM_DEALS] player 0 reach probabilities
         reach_p1: [NUM_DEALS] player 1 reach probabilities
         strategy: dict mapping infoset_key -> [num_actions] strategy tensor
-        values_p0: [NUM_DEALS] counterfactual values for player 0
+        values: [NUM_PRIVATE_STATES, NUM_PLAYERS] counterfactual values
         iteration: CFR iteration when this was recorded
     """
     history: str
@@ -43,7 +47,7 @@ class PBSDataPoint:
     reach_p0: torch.Tensor
     reach_p1: torch.Tensor
     strategy: Dict[str, torch.Tensor]
-    values_p0: torch.Tensor
+    values: torch.Tensor
     iteration: int
 
 
@@ -68,7 +72,7 @@ class RebelDataLogger:
         reach_p0: torch.Tensor,
         reach_p1: torch.Tensor,
         strategy: Dict[str, torch.Tensor],
-        values_p0: torch.Tensor,
+        values: torch.Tensor,
         iteration: int,
     ) -> None:
         """Log a single PBS data point."""
@@ -78,7 +82,7 @@ class RebelDataLogger:
             reach_p0=reach_p0.detach().clone(),
             reach_p1=reach_p1.detach().clone(),
             strategy={k: v.detach().clone() for k, v in strategy.items()},
-            values_p0=values_p0.detach().clone(),
+            values=values.detach().clone(),
             iteration=iteration,
         ))
 
@@ -86,15 +90,16 @@ class RebelDataLogger:
         """Convert logged data to tensors suitable for training.
 
         Returns:
-            beliefs: [N, NUM_DEALS] — PBS for each logged state
-            values: [N, NUM_DEALS] — counterfactual values for player 0
-            iterations: [N] — iteration indices
+            beliefs: [N, PBS_DIM] -- flattened PBS for each logged state
+            values: [N, PBS_DIM] -- flattened counterfactual values
+            iterations: [N] -- iteration indices
         """
         if not self.data:
             return {"beliefs": torch.empty(0), "values": torch.empty(0)}
 
-        beliefs = torch.stack([d.belief for d in self.data])
-        values = torch.stack([d.values_p0 for d in self.data])
+        # Flatten [NUM_PRIVATE_STATES, NUM_PLAYERS] -> [PBS_DIM] for network input
+        beliefs = torch.stack([d.belief.flatten() for d in self.data])
+        values = torch.stack([d.values.flatten() for d in self.data])
         iterations = torch.tensor([d.iteration for d in self.data])
 
         return {
@@ -124,27 +129,28 @@ class RebelDataLogger:
 class RebelValueTarget:
     """Training target for the ReBeL value network.
 
-    The value network learns: V(PBS) -> [values_per_deal]
+    The value network learns: V(PBS) -> [values_per_private_state_per_player]
 
     In ReBeL, the value network predicts the expected payoff
-    for each possible private state (deal), given the public
-    belief about what deals are possible.
+    for each possible private state per player, given the public
+    belief about what private states are possible.
 
-    For Kuhn Poker with 6 deals, input is PBS ∈ R^6, output is V ∈ R^6.
+    For Kuhn Poker, input is PBS in R^6 (flattened [3,2]),
+    output is V in R^6 (flattened [3,2]).
     """
-    pbs: torch.Tensor        # [NUM_DEALS] public belief state
-    values: torch.Tensor     # [NUM_DEALS] target values from CFR
+    pbs: torch.Tensor        # [NUM_PRIVATE_STATES, NUM_PLAYERS] public belief state
+    values: torch.Tensor     # [NUM_PRIVATE_STATES, NUM_PLAYERS] target values from CFR
 
 
 @dataclass
 class RebelPolicyTarget:
     """Training target for the ReBeL policy network.
 
-    The policy network learns: π(PBS, infoset) -> [action_probs]
+    The policy network learns: pi(PBS, infoset) -> [action_probs]
 
     For each information set at a decision point, the policy
     maps the PBS + private info to action probabilities.
     """
-    pbs: torch.Tensor                    # [NUM_DEALS] public belief state
+    pbs: torch.Tensor                    # [NUM_PRIVATE_STATES, NUM_PLAYERS] public belief state
     infoset_key: str                     # information set identifier
     action_probs: torch.Tensor           # [num_actions] target policy

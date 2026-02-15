@@ -18,7 +18,11 @@ from kuhn.belief_state import (
     BeliefStateTracker,
     ALL_DEALS,
     NUM_DEALS,
+    NUM_PRIVATE_STATES,
+    NUM_PLAYERS,
     initial_chance_probs,
+    initial_pbs,
+    reach_to_pbs,
 )
 
 
@@ -140,12 +144,15 @@ class TestBeliefStateTracker:
         tracker = BeliefStateTracker()
         beliefs = tracker.compute_belief_states()
         root = beliefs[""]
-        expected = 1.0 / NUM_DEALS
-        for d in range(NUM_DEALS):
-            assert abs(root[d].item() - expected) < 1e-6
+        # Shape should be [NUM_PRIVATE_STATES, NUM_PLAYERS]
+        assert root.shape == (NUM_PRIVATE_STATES, NUM_PLAYERS)
+        expected = 1.0 / NUM_PRIVATE_STATES
+        for c in range(NUM_PRIVATE_STATES):
+            for p in range(NUM_PLAYERS):
+                assert abs(root[c, p].item() - expected) < 1e-6
 
-    def test_beliefs_sum_to_one(self):
-        """All non-zero beliefs should sum to 1."""
+    def test_beliefs_columns_sum_to_one(self):
+        """Each player's belief column should sum to 1."""
         trainer = CFRTrainer(KuhnPoker())
         trainer.train(1000)
         profile = trainer.average_strategy_profile()
@@ -155,11 +162,13 @@ class TestBeliefStateTracker:
         beliefs = tracker.compute_belief_states()
 
         for h, b in beliefs.items():
-            total = b.sum().item()
-            if total > 0:
-                assert abs(total - 1.0) < 1e-5, (
-                    f"Belief at '{h}' sums to {total}, not 1.0"
-                )
+            assert b.shape == (NUM_PRIVATE_STATES, NUM_PLAYERS), f"Wrong shape at '{h}'"
+            for p in range(NUM_PLAYERS):
+                col_sum = b[:, p].sum().item()
+                if col_sum > 0:
+                    assert abs(col_sum - 1.0) < 1e-5, (
+                        f"Player {p} belief at '{h}' sums to {col_sum}, not 1.0"
+                    )
 
     def test_belief_update_after_bet(self):
         """After player 0 bets, belief should shift toward strong hands."""
@@ -174,12 +183,56 @@ class TestBeliefStateTracker:
         root_belief = beliefs[""]
         bet_belief = beliefs.get("b")
 
-        if bet_belief is not None and bet_belief.sum() > 0:
-            k_deals_root = sum(root_belief[i].item() for i, d in enumerate(ALL_DEALS) if d[0] == 2)
-            k_deals_bet = sum(bet_belief[i].item() for i, d in enumerate(ALL_DEALS) if d[0] == 2)
-            assert k_deals_bet >= k_deals_root - 0.05, (
-                f"Bet should increase belief of P0 having K: root={k_deals_root:.3f}, bet={k_deals_bet:.3f}"
+        if bet_belief is not None and bet_belief[:, 0].sum() > 0:
+            # K is card index 2; after P0 bets, P0's belief of holding K should increase
+            k_root = root_belief[2, 0].item()
+            k_bet = bet_belief[2, 0].item()
+            assert k_bet >= k_root - 0.05, (
+                f"Bet should increase belief of P0 having K: root={k_root:.3f}, bet={k_bet:.3f}"
             )
+
+    def test_belief_update_primarily_affects_acting_player(self):
+        """When P0 acts, P0's beliefs should change more than P1's."""
+        trainer = CFRTrainer(KuhnPoker())
+        trainer.train(5000)
+        profile = trainer.average_strategy_profile()
+
+        tracker = BeliefStateTracker()
+        tracker.set_strategy_from_profile(profile)
+        beliefs = tracker.compute_belief_states()
+
+        root = beliefs[""]
+        bet = beliefs.get("b")
+        if bet is not None:
+            # P0 acted (bet), so P0's column should change more
+            p0_change = (bet[:, 0] - root[:, 0]).abs().sum().item()
+            p1_change = (bet[:, 1] - root[:, 1]).abs().sum().item()
+            # P0's beliefs should change at least as much as P1's (or close)
+            assert p0_change >= p1_change * 0.5, (
+                f"P0 change ({p0_change:.4f}) should be comparable to P1 change ({p1_change:.4f})"
+            )
+
+
+class TestPBSHelpers:
+    def test_initial_pbs_shape(self):
+        pbs = initial_pbs()
+        assert pbs.shape == (NUM_PRIVATE_STATES, NUM_PLAYERS)
+
+    def test_initial_pbs_uniform(self):
+        pbs = initial_pbs()
+        expected = 1.0 / NUM_PRIVATE_STATES
+        for c in range(NUM_PRIVATE_STATES):
+            for p in range(NUM_PLAYERS):
+                assert abs(pbs[c, p].item() - expected) < 1e-6
+
+    def test_reach_to_pbs_uniform(self):
+        """Uniform reach should give uniform PBS."""
+        reach = torch.ones(NUM_DEALS)
+        pbs = reach_to_pbs(reach, reach)
+        expected = 1.0 / NUM_PRIVATE_STATES
+        for c in range(NUM_PRIVATE_STATES):
+            for p in range(NUM_PLAYERS):
+                assert abs(pbs[c, p].item() - expected) < 1e-5
 
 
 class TestVectorizedCFR:
@@ -220,9 +273,9 @@ class TestSubgameSolver:
         """Subgame solver should converge to near-Nash when solving full game."""
         from rebel.endgame_solver import SubgameSolver, SubgameConfig
         game = KuhnPoker()
-        initial_beliefs = torch.full((6,), 1.0 / 6.0)
+        beliefs = initial_pbs()
         config = SubgameConfig(iterations=5000)
-        solver = SubgameSolver(game, "", initial_beliefs, config=config)
+        solver = SubgameSolver(game, "", beliefs, config=config)
         profile = solver.solve()
 
         dummy = CFRTrainer(game)
@@ -240,9 +293,9 @@ class TestSubgameSolver:
         cfr_profile = trainer.average_strategy_profile()
 
         game = KuhnPoker()
-        initial_beliefs = torch.full((6,), 1.0 / 6.0)
+        beliefs = initial_pbs()
         config = SubgameConfig(iterations=5000)
-        solver = SubgameSolver(game, "", initial_beliefs, config=config)
+        solver = SubgameSolver(game, "", beliefs, config=config)
         sub_profile = solver.solve()
 
         for key in ["K|b", "J|b", "K|c", "J|c"]:
@@ -253,6 +306,16 @@ class TestSubgameSolver:
                     assert abs(s - v) < 0.15, (
                         f"Subgame mismatch at {key}/{action}: cfr={s:.3f}, sub={v:.3f}"
                     )
+
+    def test_subgame_initial_beliefs_shape(self):
+        """SubgameSolver should accept [NUM_PRIVATE_STATES, NUM_PLAYERS] beliefs."""
+        from rebel.endgame_solver import SubgameSolver, SubgameConfig
+        game = KuhnPoker()
+        beliefs = initial_pbs()
+        assert beliefs.shape == (NUM_PRIVATE_STATES, NUM_PLAYERS)
+        config = SubgameConfig(iterations=10)
+        solver = SubgameSolver(game, "", beliefs, config=config)
+        solver.solve()
 
 
 class TestRebelTrainer:

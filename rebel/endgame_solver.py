@@ -13,6 +13,10 @@ The solver is game-agnostic: it uses the Game protocol to traverse the
 game tree, enumerate chance outcomes, and compute utilities. Any game
 implementing the Game protocol can use this solver.
 
+The PBS is now [NUM_PRIVATE_STATES, NUM_PLAYERS] = [3, 2] for Kuhn.
+Internally, CFR still operates over all 6 deals; the PBS is converted
+to per-deal reach probabilities for CFR traversal.
+
 References:
   - noambrown/poker_solver: River NLHE subgame solver
   - ReBeL paper (Brown & Sandholm, 2020): Section 3.2, Subgame solving
@@ -26,6 +30,15 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 
 from game_interface import Game
+from kuhn.belief_state import (
+    ALL_DEALS,
+    CARD_TO_DEALS_P0,
+    CARD_TO_DEALS_P1,
+    NUM_DEALS,
+    NUM_PLAYERS,
+    NUM_PRIVATE_STATES,
+    reach_to_pbs,
+)
 
 
 @dataclass
@@ -41,7 +54,7 @@ class SubgameSolver:
 
     This is the core of ReBeL's search procedure. Given:
     - A game implementing the Game protocol
-    - A public belief state (probability over deals)
+    - A public belief state [NUM_PRIVATE_STATES, NUM_PLAYERS]
     - A root history in the game tree
     - Optional: a value function for leaf evaluation
 
@@ -61,10 +74,10 @@ class SubgameSolver:
     ) -> None:
         self.game = game
         self.root_history = root_history
-        self.initial_beliefs = initial_beliefs
+        self.initial_beliefs = initial_beliefs  # [NUM_PRIVATE_STATES, NUM_PLAYERS]
         self.value_fn = value_fn
         self.config = config or SubgameConfig()
-        self.num_deals = len(initial_beliefs)
+        self.num_deals = NUM_DEALS
 
         # Enumerate chance outcomes to build deal -> state mapping
         initial = game.initial_state()
@@ -81,9 +94,25 @@ class SubgameSolver:
             state = game.next_state(initial, deal)
             self._build_infoset_map(state, deal_idx)
 
+        # Convert PBS to per-deal reach probabilities for CFR
+        self._initial_reach_p0, self._initial_reach_p1 = self._pbs_to_reach(initial_beliefs)
+
         # Regret and strategy tables for the subgame
         self.regret_sum: Dict[str, torch.Tensor] = {}
         self.strategy_sum: Dict[str, torch.Tensor] = {}
+
+    @staticmethod
+    def _pbs_to_reach(pbs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Convert [NUM_PRIVATE_STATES, NUM_PLAYERS] PBS to per-deal reach [NUM_DEALS].
+
+        For each deal (c0, c1), reach_p0[deal] = pbs[c0, 0] and reach_p1[deal] = pbs[c1, 1].
+        """
+        reach_p0 = torch.zeros(NUM_DEALS)
+        reach_p1 = torch.zeros(NUM_DEALS)
+        for deal_idx, (c0, c1) in enumerate(ALL_DEALS):
+            reach_p0[deal_idx] = pbs[c0, 0]
+            reach_p1[deal_idx] = pbs[c1, 1]
+        return reach_p0, reach_p1
 
     def _build_infoset_map(self, state, deal_idx: int) -> None:
         """Recursively traverse to build infoset -> deal mapping."""
@@ -124,8 +153,8 @@ class SubgameSolver:
         initial = game.initial_state()
 
         for iteration in range(self.config.iterations):
-            reach_p0 = self.initial_beliefs.clone()
-            reach_p1 = self.initial_beliefs.clone()
+            reach_p0 = self._initial_reach_p0.clone()
+            reach_p1 = self._initial_reach_p1.clone()
 
             # Build per-deal states at the root
             deal_states = [game.next_state(initial, deal) for deal in self.all_deals]
@@ -219,12 +248,8 @@ class SubgameSolver:
     def _compute_belief(
         self, reach_p0: torch.Tensor, reach_p1: torch.Tensor
     ) -> torch.Tensor:
-        """Compute PBS from reach probabilities."""
-        joint = reach_p0 * reach_p1
-        total = joint.sum()
-        if total > 0:
-            return joint / total
-        return torch.zeros(self.num_deals)
+        """Compute PBS [NUM_PRIVATE_STATES, NUM_PLAYERS] from reach probabilities."""
+        return reach_to_pbs(reach_p0, reach_p1)
 
     def _extract_profile(self) -> Dict[str, Dict[str, float]]:
         """Extract average strategy from accumulated strategy sums."""

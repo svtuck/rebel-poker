@@ -117,7 +117,7 @@ PBS is a **sufficient statistic** for the public game tree. This means:
 
 2. **Enables generalization:** Different game situations that produce similar belief distributions should have similar values. A neural network trained on PBS can generalize across situations in a way that a lookup table indexed by game history cannot.
 
-3. **Factored representation scales:** Because PBS factors into per-player beliefs, the representation size grows linearly with the number of private states per player, not combinatorially. For no-limit hold'em, the factored PBS is a [52] vector per player (104 total), versus a [52 × 51] = 2,652-dimensional joint distribution.
+3. **Factored representation scales:** Because PBS factors into per-player beliefs, the representation size grows linearly with the number of private states per player, not combinatorially. For no-limit hold'em, the factored PBS is a [C(52,2)] = [1,326] vector per player (2,652 total), versus a [1,326 × 1,325] ≈ 1.76M-dimensional joint distribution.
 
 4. **Sound game-theoretic foundation:** The ReBeL paper proves that the value of a subgame can be expressed as a function of the PBS at its root, which is what makes depth-limited solving with a learned V(PBS) theoretically justified.
 
@@ -300,7 +300,7 @@ The current implementation represents the PBS as a **joint distribution over all
 
 The joint representation is:
 - **Correct for Kuhn Poker** — with only 6 deals, the joint and factored representations are both tractable and produce the same strategies
-- **Won't scale** — for no-limit hold'em, the joint would be 52×51 = 2,652 values vs. 52+52 = 104 in the factored form
+- **Won't scale** — for no-limit hold'em, the joint would be C(52,2)² ≈ 1.76M values vs. 2 × C(52,2) = 2,652 in the factored form
 - **Not what the paper describes** — the factored PBS is a core theoretical contribution of ReBeL
 
 Fixing this representation is tracked in issue #65 and is a prerequisite for scaling beyond Kuhn Poker.

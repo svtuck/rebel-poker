@@ -1,22 +1,23 @@
 """Public Belief State (PBS) tracking for Kuhn Poker using PyTorch.
 
-In ReBeL, a Public Belief State is a probability distribution over the
-joint private information (card deals), conditioned on the public history
-of actions. The key idea is:
+In ReBeL, a Public Belief State is a tuple (s_pub, Delta(S_1), Delta(S_2))
+where Delta(S_i) is a probability distribution over player i's private states,
+conditioned on the public history of actions.
 
-  PBS(h) = P(cards | history h) ∝ reach_0(cards, h) * reach_1(cards, h) * chance(cards)
+The key idea:
+  PBS(h) = (h, belief_p0[card], belief_p1[card])
+  where belief_pi[card] = P(player i holds card | history h)
+                        proportional to sum over opponent cards of
+                        reach_i(deal, h) * chance(deal)
 
-where reach_i is player i's probability of playing to reach history h,
-given that they hold card cards[i].
-
-This module computes belief states in a vectorized way using PyTorch tensors,
-operating over ALL card deals simultaneously. This is the foundation for
-batch CFR and eventual neural network value/policy training.
+This module computes per-player belief states in a vectorized way using
+PyTorch tensors. The factored [NUM_PRIVATE_STATES, NUM_PLAYERS] representation
+matches the ReBeL paper and is the foundation for value network training.
 
 Tensor layout:
   - deals: [6] possible card deals (i,j) where i!=j, i,j in {0,1,2}
+  - PBS: [NUM_PRIVATE_STATES, NUM_PLAYERS] = [3, 2] per-player beliefs
   - For each deal, we track reach probabilities for both players
-  - PBS at any public history = normalized product of reaches x chance probs
 """
 
 from __future__ import annotations
@@ -38,6 +39,10 @@ ALL_DEALS = [(i, j) for i in CARD_RANKS for j in CARD_RANKS if i != j]
 NUM_DEALS = len(ALL_DEALS)  # 6
 DEAL_INDEX = {deal: idx for idx, deal in enumerate(ALL_DEALS)}
 
+# Per-player private state dimensions
+NUM_PRIVATE_STATES = NUM_CARDS  # 3 (J, Q, K)
+NUM_PLAYERS = 2
+
 # Map from card to which deal indices contain that card for each player
 CARD_TO_DEALS_P0 = {c: [i for i, d in enumerate(ALL_DEALS) if d[0] == c] for c in CARD_RANKS}
 CARD_TO_DEALS_P1 = {c: [i for i, d in enumerate(ALL_DEALS) if d[1] == c] for c in CARD_RANKS}
@@ -48,12 +53,64 @@ def initial_chance_probs() -> torch.Tensor:
     return torch.full((NUM_DEALS,), 1.0 / NUM_DEALS)
 
 
+def initial_pbs(device: str = "cpu") -> torch.Tensor:
+    """Initial (uniform) public belief state. Shape: [NUM_PRIVATE_STATES, NUM_PLAYERS].
+
+    At the root, each player is equally likely to hold any card.
+    """
+    return torch.full(
+        (NUM_PRIVATE_STATES, NUM_PLAYERS), 1.0 / NUM_PRIVATE_STATES,
+        device=torch.device(device),
+    )
+
+
+def reach_to_pbs(
+    reach_p0: torch.Tensor,
+    reach_p1: torch.Tensor,
+    chance: Optional[torch.Tensor] = None,
+    device: str = "cpu",
+) -> torch.Tensor:
+    """Convert per-deal reach probabilities to factored PBS [NUM_PRIVATE_STATES, NUM_PLAYERS].
+
+    Marginalizes joint (reach * chance) over opponent's card to get each
+    player's private-state belief.
+
+    Args:
+        reach_p0: [NUM_DEALS] reach probs for player 0
+        reach_p1: [NUM_DEALS] reach probs for player 1
+        chance: [NUM_DEALS] chance probs (default: uniform)
+        device: torch device string
+
+    Returns:
+        pbs: [NUM_PRIVATE_STATES, NUM_PLAYERS] where pbs[c, p] = P(player p holds card c | history)
+    """
+    if chance is None:
+        chance = initial_chance_probs().to(reach_p0.device)
+
+    joint = chance * reach_p0 * reach_p1
+    pbs = torch.zeros(NUM_PRIVATE_STATES, NUM_PLAYERS, device=reach_p0.device)
+
+    for card in CARD_RANKS:
+        # P0's belief: marginalize over P1's card
+        pbs[card, 0] = sum(joint[i] for i in CARD_TO_DEALS_P0[card])
+        # P1's belief: marginalize over P0's card
+        pbs[card, 1] = sum(joint[i] for i in CARD_TO_DEALS_P1[card])
+
+    # Normalize each player's column to sum to 1
+    for p in range(NUM_PLAYERS):
+        total = pbs[:, p].sum()
+        if total > 0:
+            pbs[:, p] /= total
+
+    return pbs
+
+
 class BeliefStateTracker:
     """Tracks public belief states across the Kuhn Poker game tree.
 
     For each public history, maintains:
       - reach_probs[player]: shape [6] -- reach probability for each deal
-      - belief: shape [6] -- normalized PBS
+      - belief: shape [NUM_PRIVATE_STATES, NUM_PLAYERS] -- factored PBS
 
     The strategy is represented as a dict mapping infoset keys to
     action probability tensors.
@@ -166,20 +223,14 @@ class BeliefStateTracker:
     ) -> Dict[str, torch.Tensor]:
         """Compute PBS for all public histories.
 
-        PBS(h)[d] = P(deal=d | history=h) ~ chance(d) * reach_0(d,h) * reach_1(d,h)
-
-        Returns dict: history -> normalized belief tensor [6]
+        Returns dict: history -> [NUM_PRIVATE_STATES, NUM_PLAYERS] factored belief tensor
+        where pbs[card, player] = P(player holds card | history)
         """
         reaches = self.compute_all_reach_probs()
         beliefs: Dict[str, torch.Tensor] = {}
 
         for h, (reach_p0, reach_p1) in reaches.items():
-            joint = self.chance_probs * reach_p0 * reach_p1
-            total = joint.sum()
-            if total > 0:
-                beliefs[h] = joint / total
-            else:
-                beliefs[h] = torch.zeros(NUM_DEALS, device=self.device)
+            beliefs[h] = reach_to_pbs(reach_p0, reach_p1, self.chance_probs, str(self.device))
 
         return beliefs
 
@@ -200,15 +251,10 @@ class BeliefStateTracker:
         pbs = beliefs[history]
         result = {}
 
-        for opp_card in CARD_RANKS:
-            if player == 0:
-                # Sum over deals where opponent has this card
-                indices = CARD_TO_DEALS_P1[opp_card]
-            else:
-                indices = CARD_TO_DEALS_P0[opp_card]
-
-            prob = sum(pbs[i].item() for i in indices)
-            result[opp_card] = prob
+        # The opponent is the other player
+        opp = 1 - player
+        for card in CARD_RANKS:
+            result[card] = pbs[card, opp].item()
 
         return result
 
