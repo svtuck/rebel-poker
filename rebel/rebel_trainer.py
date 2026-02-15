@@ -1,129 +1,154 @@
-"""ReBeL training loop for Kuhn Poker.
+"""ReBeL training loop (game-agnostic).
 
-This implements the ReBeL algorithm's training pipeline:
+Implements the complete ReBeL algorithm (Brown & Sandholm, 2020):
 
-1. Self-play with CFR at decision points
-2. Log PBS + values at each decision point
-3. Train value network V(PBS) on accumulated data
-4. Use V(PBS) as leaf evaluator in subsequent CFR iterations
+  for each iteration:
+    1. Sample a public state (or use root)
+    2. Build PBS at that state
+    3. Run depth-limited CFR with value net V at leaves
+    4. Collect (PBS, CFR_values) training pairs from the solve
+    5. Add pairs to replay buffer
+    6. Train V on replay buffer
+    7. Evaluate exploitability of the resulting strategy
 
-The key loop is:
-  for epoch in range(num_epochs):
-    1. Run CFR on full game (or subgame) using current V as leaf evaluator
-    2. Collect training data: (PBS, CFR_values) pairs
-    3. Train V to predict CFR_values from PBS
-    4. Evaluate: compare V-predicted values to actual CFR values
+The key difference from plain CFR: the value network learns to predict
+counterfactual values from PBS, and feeds back into CFR as a leaf evaluator.
+This creates a self-improving loop where the value net bootstraps better
+CFR solves, which produce better training data for the value net.
 
-For Kuhn Poker, this is overkill (the game is fully solvable by tabular CFR),
-but it validates the approach before scaling to Leduc and NLHE.
+The trainer is game-agnostic: it accepts any Game + BeliefConfig pair.
+Game-specific details (deal structures, terminal histories, infoset keys)
+are handled by the game and config objects.
 """
 
 from __future__ import annotations
 
+from collections import deque
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
-from game_interface import Game
-from kuhn.game import KuhnPoker, RANK_NAMES, CARD_RANKS
-from kuhn.belief_state import (
-    ALL_DEALS,
-    CARD_TO_DEALS_P0,
-    CARD_TO_DEALS_P1,
-    NUM_DEALS,
-    NUM_PLAYERS,
-    NUM_PRIVATE_STATES,
-    TERMINAL_HISTORIES,
-    BeliefStateTracker,
-    reach_to_pbs,
-)
+from belief_config import BeliefConfig, belief_config_from_game
 from cfr.solver import CFRTrainer
+from game_interface import Game
 from rebel.value_net import ValueNetwork, train_value_network
-from rebel.data_logger import RebelDataLogger
+from rebel.endgame_solver import SubgameSolver, SubgameConfig
 
 
-def deal_values_to_pbs_values(
-    node_values: torch.Tensor,
-) -> torch.Tensor:
-    """Convert per-deal values [NUM_DEALS] to per-private-state values [NUM_PRIVATE_STATES, NUM_PLAYERS].
+@dataclass
+class RebelConfig:
+    """Configuration for the ReBeL training loop."""
+    num_iters: int = 100
+    cfr_iters_per_solve: int = 200
+    learning_rate: float = 1e-3
+    batch_size: int = 32
+    value_hidden_dim: int = 64
+    value_train_epochs: int = 100
+    replay_buffer_size: int = 10000
+    max_depth: Optional[int] = None  # None = full solve (no depth limit)
+    device: str = "cpu"
 
-    For each (card, player), averages the value across all deals where
-    that player holds that card.
-    """
-    pbs_values = torch.zeros(NUM_PRIVATE_STATES, NUM_PLAYERS, device=node_values.device)
 
-    for card in CARD_RANKS:
-        # Player 0's value when holding this card
-        p0_indices = CARD_TO_DEALS_P0[card]
-        if p0_indices:
-            pbs_values[card, 0] = sum(node_values[i] for i in p0_indices) / len(p0_indices)
+class ReplayBuffer:
+    """Fixed-size replay buffer for (PBS, values) training pairs."""
 
-        # Player 1's value (negated, since values are from P0's perspective)
-        p1_indices = CARD_TO_DEALS_P1[card]
-        if p1_indices:
-            pbs_values[card, 1] = sum(-node_values[i] for i in p1_indices) / len(p1_indices)
+    def __init__(self, max_size: int = 10000) -> None:
+        self._beliefs: deque = deque(maxlen=max_size)
+        self._values: deque = deque(maxlen=max_size)
 
-    return pbs_values
+    def add(self, belief: torch.Tensor, values: torch.Tensor) -> None:
+        """Add a (PBS, values) pair. Both should be [num_private_states, num_players]."""
+        self._beliefs.append(belief.detach().clone().flatten())
+        self._values.append(values.detach().clone().flatten())
+
+    def to_dataset(self) -> Dict[str, torch.Tensor]:
+        """Convert buffer to tensors for training."""
+        if not self._beliefs:
+            return {"beliefs": torch.empty(0), "values": torch.empty(0)}
+        return {
+            "beliefs": torch.stack(list(self._beliefs)),
+            "values": torch.stack(list(self._values)),
+        }
+
+    def __len__(self) -> int:
+        return len(self._beliefs)
 
 
 class RebelTrainer:
-    """Full ReBeL training pipeline for Kuhn Poker.
+    """Full ReBeL training pipeline for any imperfect-information game.
 
-    This orchestrates the self-play, data collection, and neural
-    network training loop.
+    Orchestrates the self-play, data collection, and neural network
+    training loop. The value network is used as a leaf evaluator
+    during CFR, creating the feedback loop that is the core of ReBeL.
+
+    Args:
+        game: Any game implementing the Game protocol
+        belief_config: BeliefConfig for the game (or auto-derived if not provided)
+        config: RebelConfig with hyperparameters
     """
 
     def __init__(
         self,
+        game: Optional[Game] = None,
+        belief_config: Optional[BeliefConfig] = None,
+        config: Optional[RebelConfig] = None,
+        # Legacy kwargs for backward compatibility with existing tests
         value_hidden_dim: int = 64,
         learning_rate: float = 1e-3,
         cfr_iterations: int = 100,
         device: str = "cpu",
     ) -> None:
-        self.game = KuhnPoker()
-        self.device = torch.device(device)
-        self.cfr_iterations = cfr_iterations
-        self.lr = learning_rate
+        if config is not None:
+            self.config = config
+        else:
+            self.config = RebelConfig(
+                value_hidden_dim=value_hidden_dim,
+                learning_rate=learning_rate,
+                cfr_iters_per_solve=cfr_iterations,
+                device=device,
+            )
 
-        # Value network
-        self.value_net = ValueNetwork(hidden_dim=value_hidden_dim).to(self.device)
+        # Default to Kuhn if no game provided (backward compat)
+        if game is None:
+            from kuhn.game import KuhnPoker
+            game = KuhnPoker()
 
-        # Data logger
-        self.logger = RebelDataLogger()
+        self.game = game
 
-        # CFR state
-        self.regret_sum: Dict[str, torch.Tensor] = {}
-        self.strategy_sum: Dict[str, torch.Tensor] = {}
+        if belief_config is not None:
+            self.belief_config = belief_config
+        else:
+            self.belief_config = belief_config_from_game(self.game)
 
-        # Terminal values (precomputed)
-        self._terminal_values = self._precompute_terminal_values()
+        self.device = torch.device(self.config.device)
+
+        # Value network: V(PBS) -> counterfactual values
+        bc = self.belief_config
+        self.value_net = ValueNetwork(
+            pbs_dim=bc.pbs_dim,
+            hidden_dim=self.config.value_hidden_dim,
+        ).to(self.device)
+
+        # Replay buffer
+        self.replay_buffer = ReplayBuffer(max_size=self.config.replay_buffer_size)
 
         # Training history
         self.value_losses: List[float] = []
         self.exploitabilities: List[float] = []
 
-    def _precompute_terminal_values(self) -> Dict[str, torch.Tensor]:
-        values = {}
-        for h in TERMINAL_HISTORIES:
-            v = torch.zeros(NUM_DEALS, device=self.device)
-            for deal_idx, (c0, c1) in enumerate(ALL_DEALS):
-                state = self.game.next_state(self.game.initial_state(), (c0, c1))
-                for action in h:
-                    state = self.game.next_state(state, action)
-                v[deal_idx] = self.game.terminal_utility(state, 0)
-            values[h] = v
-        return values
+    def _value_fn(self, pbs: torch.Tensor) -> torch.Tensor:
+        """Value function for leaf evaluation during CFR.
 
-    def _get_strategy(self, key: str, num_actions: int) -> torch.Tensor:
-        if key not in self.regret_sum:
-            self.regret_sum[key] = torch.zeros(num_actions, device=self.device)
-            self.strategy_sum[key] = torch.zeros(num_actions, device=self.device)
-        positives = torch.clamp(self.regret_sum[key], min=0)
-        total = positives.sum()
-        if total > 0:
-            return positives / total
-        return torch.full((num_actions,), 1.0 / num_actions, device=self.device)
+        Takes PBS [num_private_states, num_players], returns values in same shape.
+        """
+        self.value_net.eval()
+        with torch.no_grad():
+            flat = pbs.flatten().unsqueeze(0).to(self.device)
+            pred = self.value_net(flat).squeeze(0)
+        bc = self.belief_config
+        return pred.view(bc.num_private_states, bc.num_players).cpu()
 
     def train(
         self,
@@ -133,33 +158,53 @@ class RebelTrainer:
     ) -> Dict[str, List[float]]:
         """Run the full ReBeL training loop.
 
-        Returns training metrics.
+        Args:
+            num_epochs: number of ReBeL iterations (outer loop)
+            cfr_iters_per_epoch: CFR iterations per subgame solve
+            value_train_epochs: gradient steps per value net training phase
+
+        Returns:
+            Training metrics dict with 'value_losses' and 'exploitabilities'.
         """
-        chance = torch.full((NUM_DEALS,), 1.0 / NUM_DEALS, device=self.device)
+        bc = self.belief_config
+        cfr_iters = cfr_iters_per_epoch or self.config.cfr_iters_per_solve
 
         for epoch in range(num_epochs):
-            self.logger.clear()
+            # Phase 1: Run CFR solve (with value net at leaves if depth-limited)
+            beliefs = bc.initial_pbs(str(self.device))
 
-            # Phase 1: Run CFR, collecting PBS data
-            for cfr_iter in range(cfr_iters_per_epoch):
-                self._cfr_with_logging(
-                    "", chance.clone(), chance.clone(), cfr_iter
-                )
+            value_fn = self._value_fn if self.config.max_depth is not None else None
+            solver_config = SubgameConfig(
+                iterations=cfr_iters,
+                max_depth=self.config.max_depth,
+            )
+            solver = SubgameSolver(
+                game=self.game,
+                belief_config=bc,
+                root_history="",
+                initial_beliefs=beliefs,
+                value_fn=value_fn,
+                config=solver_config,
+            )
+            profile, root_values = solver.solve_with_values()
 
-            # Phase 2: Train value network on collected data
-            dataset = self.logger.to_dataset()
+            # Collect training data from all decision points in this solve
+            self._collect_training_data(solver, cfr_iters)
+
+            # Phase 2: Train value network on replay buffer
+            dataset = self.replay_buffer.to_dataset()
             if len(dataset["beliefs"]) > 0:
                 losses = train_value_network(
                     self.value_net,
                     dataset,
                     epochs=value_train_epochs,
-                    lr=self.lr,
+                    lr=self.config.learning_rate,
+                    batch_size=self.config.batch_size,
                 )
                 if losses:
                     self.value_losses.append(losses[-1])
 
-            # Phase 3: Evaluate
-            profile = self._extract_profile()
+            # Phase 3: Evaluate exploitability of the strategy
             dummy = CFRTrainer(self.game)
             br0 = dummy._best_response_value(profile, 0)
             br1 = dummy._best_response_value(profile, 1)
@@ -171,119 +216,130 @@ class RebelTrainer:
             "exploitabilities": self.exploitabilities,
         }
 
-    def _cfr_with_logging(
+    def _collect_training_data(
+        self, solver: SubgameSolver, cfr_iters: int,
+    ) -> None:
+        """Collect (PBS, values) pairs from a completed CFR solve.
+
+        Runs a single forward pass through the tree using the solver's
+        converged average strategy.
+        """
+        game = self.game
+        bc = self.belief_config
+        initial = game.initial_state()
+
+        ones = torch.ones(bc.num_deals)
+        deal_states = [game.next_state(initial, deal) for deal in solver.all_deals]
+
+        self._traverse_for_data(
+            solver, deal_states, ones.clone(), ones.clone(), depth=0,
+        )
+
+    def _traverse_for_data(
         self,
-        history: str,
+        solver: SubgameSolver,
+        states: list,
         reach_p0: torch.Tensor,
         reach_p1: torch.Tensor,
-        iteration: int,
+        depth: int,
     ) -> torch.Tensor:
-        """CFR traversal that also logs PBS data for value network training."""
+        """Traverse the solved game tree to collect training data.
 
-        if history in TERMINAL_HISTORIES:
-            return self._terminal_values[history]
+        Uses the solver's average strategy to compute expected values,
+        then logs (PBS, values) pairs at each decision point.
+        """
+        game = solver.game
+        bc = solver.belief_config
 
-        player = len(history) % 2
-        if history in ("", "c"):
-            actions = ["c", "b"]
-        elif history in ("b", "cb"):
-            actions = ["c", "f"]
-        else:
-            return torch.zeros(NUM_DEALS, device=self.device)
+        if game.is_terminal(states[0]):
+            v = torch.zeros(bc.num_deals)
+            for d_idx, state in enumerate(states):
+                v[d_idx] = game.terminal_utility(state, 0)
+            return v
 
+        # If depth-limited and at leaf, use value net
+        if solver.config.max_depth is not None and depth >= solver.config.max_depth:
+            if solver.value_fn is not None:
+                pbs = bc.reach_to_pbs(reach_p0, reach_p1)
+                pbs_values = solver.value_fn(pbs)
+                return bc.pbs_values_to_deal_values(pbs_values)
+
+        player = game.current_player(states[0])
+        actions = game.legal_actions(states[0])
         num_actions = len(actions)
-        action_values = []
+        profile = solver._extract_profile()
+
+        # Group deals by infoset
+        infoset_deals: Dict[str, List[int]] = {}
+        for d_idx, state in enumerate(states):
+            key = game.infoset_key(state, player)
+            infoset_deals.setdefault(key, []).append(d_idx)
+
+        # Compute strategy per deal from average strategy
         strategy_per_deal = []
-
-        card_to_deals = CARD_TO_DEALS_P0 if player == 0 else CARD_TO_DEALS_P1
-
         for a_idx, action in enumerate(actions):
-            s = torch.zeros(NUM_DEALS, device=self.device)
-            for card in CARD_RANKS:
-                key = f"{RANK_NAMES[card]}|{history}"
-                strat = self._get_strategy(key, num_actions)
-                for deal_idx in card_to_deals[card]:
-                    s[deal_idx] = strat[a_idx]
+            s = torch.zeros(bc.num_deals)
+            for key, deal_indices in infoset_deals.items():
+                action_probs = profile.get(key, {})
+                prob = action_probs.get(action, 1.0 / num_actions)
+                for d_idx in deal_indices:
+                    s[d_idx] = prob
             strategy_per_deal.append(s)
 
-            child_history = history + action
+        # Recurse to get action values
+        action_values = []
+        for a_idx, action in enumerate(actions):
+            child_states = [game.next_state(state, action) for state in states]
+            s = strategy_per_deal[a_idx]
             if player == 0:
-                child_values = self._cfr_with_logging(
-                    child_history, reach_p0 * s, reach_p1, iteration
+                child_vals = self._traverse_for_data(
+                    solver, child_states, reach_p0 * s, reach_p1, depth + 1,
                 )
             else:
-                child_values = self._cfr_with_logging(
-                    child_history, reach_p0, reach_p1 * s, iteration
+                child_vals = self._traverse_for_data(
+                    solver, child_states, reach_p0, reach_p1 * s, depth + 1,
                 )
-            action_values.append(child_values)
+            action_values.append(child_vals)
 
         action_values_t = torch.stack(action_values)
         strategy_t = torch.stack(strategy_per_deal)
         node_values = (strategy_t * action_values_t).sum(dim=0)
 
-        # Log PBS and values for this decision point
+        # Log training data for this decision point
         joint = reach_p0 * reach_p1
-        total = joint.sum()
-        if total > 0:
-            belief = reach_to_pbs(reach_p0, reach_p1, device=str(self.device))
-            pbs_values = deal_values_to_pbs_values(node_values)
-            strategy_dict = {}
-            for card in CARD_RANKS:
-                key = f"{RANK_NAMES[card]}|{history}"
-                strategy_dict[key] = self._get_strategy(key, num_actions)
-
-            self.logger.log_state(
-                history=history,
-                belief=belief,
-                reach_p0=reach_p0,
-                reach_p1=reach_p1,
-                strategy=strategy_dict,
-                values=pbs_values,
-                iteration=iteration,
-            )
-
-        # Update regrets
-        opponent_reach = reach_p1 if player == 0 else reach_p0
-        player_reach = reach_p0 if player == 0 else reach_p1
-
-        for card in CARD_RANKS:
-            key = f"{RANK_NAMES[card]}|{history}"
-            strat = self._get_strategy(key, num_actions)
-            indices = card_to_deals[card]
-
-            for a_idx in range(num_actions):
-                opp_vals = torch.stack([opponent_reach[i] for i in indices])
-                act_vals = torch.stack([action_values_t[a_idx][i] for i in indices])
-                node_vals = torch.stack([node_values[i] for i in indices])
-
-                if player == 0:
-                    regret = (opp_vals * (act_vals - node_vals)).sum()
-                else:
-                    regret = (opp_vals * (node_vals - act_vals)).sum()
-
-                self.regret_sum[key][a_idx] += regret
-
-            p_r = sum(player_reach[i].item() for i in indices)
-            self.strategy_sum[key] += p_r * strat
+        if joint.sum() > 1e-10:
+            pbs = bc.reach_to_pbs(reach_p0, reach_p1)
+            pbs_values = bc.deal_values_to_pbs_values(node_values)
+            self.replay_buffer.add(pbs, pbs_values)
 
         return node_values
 
-    def _extract_profile(self) -> Dict[str, Dict[str, float]]:
-        profile = {}
-        for key, strat_sum in self.strategy_sum.items():
-            total = strat_sum.sum()
-            if total > 0:
-                avg = strat_sum / total
-            else:
-                n = len(strat_sum)
-                avg = torch.full((n,), 1.0 / n)
+    def run_full_training(self) -> Dict[str, List[float]]:
+        """Run the complete ReBeL training loop using config parameters.
 
-            parts = key.split("|")
-            history = parts[1] if len(parts) > 1 else ""
-            if history in ("", "c"):
-                actions = ["c", "b"]
-            else:
-                actions = ["c", "f"]
+        This is the primary entry point for the full training pipeline.
+        """
+        return self.train(
+            num_epochs=self.config.num_iters,
+            cfr_iters_per_epoch=self.config.cfr_iters_per_solve,
+            value_train_epochs=self.config.value_train_epochs,
+        )
 
-            profile[key] = {a: avg[i].item() for i, a in enumerate(actions)}
-        return profile
+    def get_strategy(self) -> Dict[str, Dict[str, float]]:
+        """Get the current best strategy by running a final CFR solve."""
+        bc = self.belief_config
+        beliefs = bc.initial_pbs(str(self.device))
+        value_fn = self._value_fn if self.config.max_depth is not None else None
+        solver_config = SubgameConfig(
+            iterations=self.config.cfr_iters_per_solve,
+            max_depth=self.config.max_depth,
+        )
+        solver = SubgameSolver(
+            game=self.game,
+            belief_config=bc,
+            root_history="",
+            initial_beliefs=beliefs,
+            value_fn=value_fn,
+            config=solver_config,
+        )
+        return solver.solve()

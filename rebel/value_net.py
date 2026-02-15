@@ -1,57 +1,54 @@
-"""ReBeL Value and Policy Networks for Kuhn Poker.
+"""ReBeL Value and Policy Networks (game-agnostic).
 
-These are the neural network components that will eventually replace
-CFR's tabular solution. In ReBeL:
+These are the neural network components for ReBeL's search procedure:
 
 1. The value network V(PBS) predicts expected payoffs for each possible
    private state per player
 2. The policy network pi(PBS, private_info) predicts action probabilities
 
-For Kuhn Poker, these are small networks suitable for validating the
-approach before scaling to larger games.
+Network dimensions are parameterized by pbs_dim and num_private_states,
+which come from the game's BeliefConfig. This allows the same network
+architecture to work with Kuhn (pbs_dim=6), Leduc (pbs_dim=12), or
+larger games.
 
-The PBS is represented as [NUM_PRIVATE_STATES, NUM_PLAYERS] = [3, 2],
-which is flattened to PBS_DIM = 6 for network input/output.
+PBS layout: [num_private_states, num_players] flattened to [pbs_dim]
 """
 
 from __future__ import annotations
 
-from typing import Dict, Tuple
+from typing import Dict
 
 import torch
 import torch.nn as nn
-
-from kuhn.belief_state import NUM_PRIVATE_STATES, NUM_PLAYERS
-
-# Flattened PBS dimension for network I/O
-PBS_DIM = NUM_PRIVATE_STATES * NUM_PLAYERS  # 6 for Kuhn
 
 
 class ValueNetwork(nn.Module):
     """Predicts counterfactual values from a public belief state.
 
-    Input: PBS flattened to R^{PBS_DIM} (flattened [NUM_PRIVATE_STATES, NUM_PLAYERS])
-    Output: V in R^{PBS_DIM} (expected value for each private state per player)
+    Input: PBS flattened to R^{pbs_dim}
+    Output: V in R^{pbs_dim} (expected value for each private state per player)
 
-    Architecture is deliberately simple for Kuhn Poker.
-    For larger games, this would be much deeper.
+    Args:
+        pbs_dim: Flattened PBS dimension (num_private_states * num_players)
+        hidden_dim: Hidden layer width
     """
 
-    def __init__(self, hidden_dim: int = 64) -> None:
+    def __init__(self, pbs_dim: int = 6, hidden_dim: int = 64) -> None:
         super().__init__()
+        self.pbs_dim = pbs_dim
         self.net = nn.Sequential(
-            nn.Linear(PBS_DIM, hidden_dim),
+            nn.Linear(pbs_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, PBS_DIM),
+            nn.Linear(hidden_dim, pbs_dim),
         )
 
     def forward(self, pbs: torch.Tensor) -> torch.Tensor:
         """Forward pass.
 
         Args:
-            pbs: [batch, PBS_DIM] or [PBS_DIM] (flattened PBS)
+            pbs: [batch, pbs_dim] or [pbs_dim] (flattened PBS)
         Returns:
             values: same shape as input
         """
@@ -61,25 +58,34 @@ class ValueNetwork(nn.Module):
 class PolicyNetwork(nn.Module):
     """Predicts action probabilities from PBS + private card information.
 
-    Input: [PBS flattened in R^{PBS_DIM}, card_onehot in R^{NUM_PRIVATE_STATES}]
+    Input: [PBS flattened in R^{pbs_dim}, card_onehot in R^{num_private_states}]
     Output: action_probs in R^{max_actions}
 
-    The card encoding is a one-hot vector indicating which card the
-    acting player holds. Combined with the PBS, this gives the full
-    information needed for a decision.
+    Args:
+        pbs_dim: Flattened PBS dimension
+        num_private_states: Number of private states per player
+        max_actions: Maximum number of actions at any decision point
+        hidden_dim: Hidden layer width
     """
 
-    MAX_ACTIONS = 2  # Kuhn Poker always has exactly 2 actions
-
-    def __init__(self, hidden_dim: int = 64) -> None:
+    def __init__(
+        self,
+        pbs_dim: int = 6,
+        num_private_states: int = 3,
+        max_actions: int = 2,
+        hidden_dim: int = 64,
+    ) -> None:
         super().__init__()
-        input_dim = PBS_DIM + NUM_PRIVATE_STATES
+        self.pbs_dim = pbs_dim
+        self.num_private_states = num_private_states
+        self.max_actions = max_actions
+        input_dim = pbs_dim + num_private_states
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, self.MAX_ACTIONS),
+            nn.Linear(hidden_dim, max_actions),
         )
 
     def forward(
@@ -88,10 +94,10 @@ class PolicyNetwork(nn.Module):
         """Forward pass.
 
         Args:
-            pbs: [batch, PBS_DIM] (flattened PBS)
-            card_onehot: [batch, NUM_PRIVATE_STATES]
+            pbs: [batch, pbs_dim] (flattened PBS)
+            card_onehot: [batch, num_private_states]
         Returns:
-            action_probs: [batch, MAX_ACTIONS] (softmax probabilities)
+            action_probs: [batch, max_actions] (softmax probabilities)
         """
         x = torch.cat([pbs, card_onehot], dim=-1)
         logits = self.net(x)
@@ -117,8 +123,8 @@ def train_value_network(
     Returns:
         List of training losses per epoch
     """
-    beliefs = dataset["beliefs"]  # [N, PBS_DIM]
-    values = dataset["values"]    # [N, PBS_DIM]
+    beliefs = dataset["beliefs"]  # [N, pbs_dim]
+    values = dataset["values"]    # [N, pbs_dim]
 
     if len(beliefs) == 0:
         return []

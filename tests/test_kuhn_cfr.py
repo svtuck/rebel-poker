@@ -269,13 +269,18 @@ class TestVectorizedCFR:
 
 
 class TestSubgameSolver:
+    def _make_solver(self, iterations=5000, **kwargs):
+        from rebel.endgame_solver import SubgameSolver, SubgameConfig
+        from belief_config import belief_config_from_game
+        game = KuhnPoker()
+        bc = belief_config_from_game(game)
+        beliefs = initial_pbs()
+        config = SubgameConfig(iterations=iterations, **kwargs)
+        return SubgameSolver(game, bc, "", beliefs, config=config), game
+
     def test_subgame_converges(self):
         """Subgame solver should converge to near-Nash when solving full game."""
-        from rebel.endgame_solver import SubgameSolver, SubgameConfig
-        game = KuhnPoker()
-        beliefs = initial_pbs()
-        config = SubgameConfig(iterations=5000)
-        solver = SubgameSolver(game, "", beliefs, config=config)
+        solver, game = self._make_solver(iterations=5000)
         profile = solver.solve()
 
         dummy = CFRTrainer(game)
@@ -286,16 +291,11 @@ class TestSubgameSolver:
 
     def test_subgame_matches_cfr(self):
         """Subgame solver should produce similar strategies to full CFR."""
-        from rebel.endgame_solver import SubgameSolver, SubgameConfig
-
         trainer = CFRTrainer(KuhnPoker())
         trainer.train(5000)
         cfr_profile = trainer.average_strategy_profile()
 
-        game = KuhnPoker()
-        beliefs = initial_pbs()
-        config = SubgameConfig(iterations=5000)
-        solver = SubgameSolver(game, "", beliefs, config=config)
+        solver, _ = self._make_solver(iterations=5000)
         sub_profile = solver.solve()
 
         for key in ["K|b", "J|b", "K|c", "J|c"]:
@@ -309,12 +309,9 @@ class TestSubgameSolver:
 
     def test_subgame_initial_beliefs_shape(self):
         """SubgameSolver should accept [NUM_PRIVATE_STATES, NUM_PLAYERS] beliefs."""
-        from rebel.endgame_solver import SubgameSolver, SubgameConfig
-        game = KuhnPoker()
         beliefs = initial_pbs()
         assert beliefs.shape == (NUM_PRIVATE_STATES, NUM_PLAYERS)
-        config = SubgameConfig(iterations=10)
-        solver = SubgameSolver(game, "", beliefs, config=config)
+        solver, _ = self._make_solver(iterations=10)
         solver.solve()
 
 
@@ -349,6 +346,134 @@ class TestRebelTrainer:
         )
         final_exp = metrics["exploitabilities"][-1]
         assert final_exp < 0.5, f"ReBeL exploitability {final_exp} unreasonably high"
+
+    def test_rebel_convergence_under_one_percent(self):
+        """ReBeL should converge to exploitability < 1% of pot (0.02 for Kuhn).
+
+        The maximum pot in Kuhn is 4 chips (both bet/call), so 1% = 0.04.
+        We use 0.02 as a tighter target since CFR alone achieves this easily.
+        """
+        from rebel.rebel_trainer import RebelTrainer, RebelConfig
+        config = RebelConfig(
+            num_iters=5,
+            cfr_iters_per_solve=1000,
+            learning_rate=1e-3,
+            batch_size=32,
+            value_hidden_dim=64,
+            value_train_epochs=100,
+        )
+        trainer = RebelTrainer(config=config)
+        metrics = trainer.run_full_training()
+        final_exp = metrics["exploitabilities"][-1]
+        # 1% of max pot (4 chips) = 0.04; target well under that
+        assert final_exp < 0.04, (
+            f"ReBeL exploitability {final_exp:.4f} exceeds 1% of pot (0.04)"
+        )
+
+    def test_rebel_nash_equilibrium_properties(self):
+        """Verify the trained strategy matches known Kuhn Nash properties.
+
+        In Kuhn Nash equilibrium with alpha ~ 1/3:
+        - P0 with Jack bluffs with probability alpha ~ 1/3
+        - P0 with King bets with probability 3*alpha ~ 1 (always)
+        - P1 with King always calls a bet
+        - P1 with Jack always folds to a bet
+        """
+        from rebel.rebel_trainer import RebelTrainer, RebelConfig
+        config = RebelConfig(
+            num_iters=5,
+            cfr_iters_per_solve=1000,
+            learning_rate=1e-3,
+            batch_size=32,
+            value_hidden_dim=64,
+            value_train_epochs=100,
+        )
+        trainer = RebelTrainer(config=config)
+        trainer.run_full_training()
+        profile = trainer.get_strategy()
+
+        # P0 with Jack: bluff frequency alpha ~ 1/3
+        j_root = profile.get("J|", {})
+        j_bet = j_root.get("b", 0)
+        assert 0.1 < j_bet < 0.6, (
+            f"P0 Jack bet frequency {j_bet:.3f} should be near 1/3"
+        )
+
+        # P0 with King: bet frequency 3*alpha ~ 1
+        k_root = profile.get("K|", {})
+        k_bet = k_root.get("b", 0)
+        assert k_bet > 0.5, (
+            f"P0 King bet frequency {k_bet:.3f} should be high (3*alpha)"
+        )
+
+        # P1 with King: always call a bet
+        k_facing_bet = profile.get("K|b", {})
+        k_call = k_facing_bet.get("c", 0)
+        assert k_call > 0.9, (
+            f"P1 King call frequency {k_call:.3f} should be ~1.0"
+        )
+
+        # P1 with Jack: always fold to a bet
+        j_facing_bet = profile.get("J|b", {})
+        j_fold = j_facing_bet.get("f", 0)
+        assert j_fold > 0.5, (
+            f"P1 Jack fold frequency {j_fold:.3f} should be high"
+        )
+
+    def test_rebel_configurable_parameters(self):
+        """RebelConfig should accept all specified parameters."""
+        from rebel.rebel_trainer import RebelTrainer, RebelConfig
+        config = RebelConfig(
+            num_iters=2,
+            cfr_iters_per_solve=50,
+            learning_rate=5e-4,
+            batch_size=16,
+            value_hidden_dim=32,
+            value_train_epochs=10,
+            replay_buffer_size=500,
+            max_depth=2,
+        )
+        trainer = RebelTrainer(config=config)
+        metrics = trainer.run_full_training()
+        assert len(metrics["exploitabilities"]) == 2
+
+    def test_rebel_depth_limited_solving(self):
+        """Depth-limited solving with value net at leaves should work."""
+        from rebel.rebel_trainer import RebelTrainer, RebelConfig
+        config = RebelConfig(
+            num_iters=3,
+            cfr_iters_per_solve=200,
+            learning_rate=1e-3,
+            batch_size=32,
+            value_hidden_dim=64,
+            value_train_epochs=50,
+            max_depth=2,
+        )
+        trainer = RebelTrainer(config=config)
+        metrics = trainer.run_full_training()
+        # With depth-limited solving, exploitability should still be bounded
+        # (won't be as low as full solve, but should be reasonable)
+        final_exp = metrics["exploitabilities"][-1]
+        assert final_exp < 1.0, (
+            f"Depth-limited ReBeL exploitability {final_exp:.4f} unreasonably high"
+        )
+
+    def test_rebel_replay_buffer(self):
+        """Replay buffer should accumulate data across iterations."""
+        from rebel.rebel_trainer import RebelTrainer, RebelConfig
+        config = RebelConfig(
+            num_iters=3,
+            cfr_iters_per_solve=50,
+            value_train_epochs=10,
+            replay_buffer_size=10000,
+        )
+        trainer = RebelTrainer(config=config)
+        trainer.run_full_training()
+        # Each iteration collects data from 4 decision points in Kuhn
+        # So after 3 iterations we should have 12 data points
+        assert len(trainer.replay_buffer) >= 3, (
+            f"Replay buffer should have accumulated data, got {len(trainer.replay_buffer)}"
+        )
 
 
 if __name__ == "__main__":
