@@ -131,6 +131,7 @@
         .detail-panel {
             padding: 20px;
             overflow-y: auto;
+            min-width: 0;
         }
 
         .detail-panel h2 {
@@ -223,17 +224,19 @@
             border-radius: 6px;
             padding: 16px;
             margin-bottom: 16px;
+            overflow: hidden;
         }
 
         .belief-grid {
             display: grid;
-            grid-template-columns: 80px repeat(6, 1fr);
+            grid-template-columns: 60px repeat(6, 1fr);
             gap: 2px;
             font-size: 11px;
+            max-width: 100%;
         }
 
         .belief-cell {
-            padding: 8px 4px;
+            padding: 8px 8px;
             text-align: center;
             border-radius: 2px;
         }
@@ -638,7 +641,7 @@
         });
 
         if (entry && entry.payoffs) {
-            html += `<div style="display:grid;grid-template-columns:auto repeat(6,1fr);gap:2px;font-size:11px;">`;
+            html += `<div style="display:grid;grid-template-columns:auto repeat(6,minmax(60px,1fr));gap:2px;font-size:11px;">`;
             html += `<div class="belief-cell belief-header"></div>`;
             for (const dl of DEAL_LABELS) {
                 html += `<div class="belief-cell belief-header">${dl}</div>`;
@@ -689,10 +692,11 @@
         html += `</div>`;
 
         // Mini bar chart
-        html += `<div style="margin-top:12px;display:flex;height:60px;align-items:flex-end;gap:4px;">`;
+        html += `<div style="margin-top:12px;display:flex;height:60px;align-items:flex-end;gap:4px;overflow:hidden;">`;
         for (let i = 0; i < entry.belief.length; i++) {
             const b = entry.belief[i];
-            const h = Math.max(b * 300, 2);
+            const maxBelief = Math.max(...entry.belief);
+            const h = maxBelief > 0 ? Math.max(b / maxBelief * 50, 2) : 2;
             html += `<div style="flex:1;display:flex;flex-direction:column;align-items:center;">`;
             html += `<div style="width:100%;height:${h}px;background:var(--accent);border-radius:2px 2px 0 0;"></div>`;
             html += `<div style="font-size:9px;color:var(--text-dim);margin-top:2px;">${DEAL_LABELS[i]}</div>`;
