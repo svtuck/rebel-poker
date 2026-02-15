@@ -17,6 +17,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+from game_interface import Game
+
+NUM_RANKS = 3
 RANKS = [0, 1, 2]
 RANK_TO_STR = {0: "J", 1: "Q", 2: "K"}
 DECK = [(rank, copy) for rank in RANKS for copy in (0, 1)]
@@ -246,3 +249,17 @@ class LeducPoker:
         if p1_rank > p0_rank:
             return 1
         return None
+
+    # ---- Enumeration helpers ----
+
+    def all_deals(self) -> List[Tuple[Tuple[int, int], Tuple[int, int]]]:
+        """All possible (card_p0, card_p1) private card deals."""
+        return [(c0, c1) for i, c0 in enumerate(DECK) for j, c1 in enumerate(DECK) if i != j]
+
+    def all_board_cards(self, cards) -> List[Tuple[int, int]]:
+        """All possible board cards given the private cards dealt."""
+        return [c for c in DECK if c not in cards]
+
+
+# Verify LeducPoker satisfies the Game protocol at import time
+assert isinstance(LeducPoker(), Game), "LeducPoker must implement the Game protocol"
