@@ -4,7 +4,7 @@ Default scenario: Ks Th 7s 4d 2s board, 1000 pot, 9500 stacks, 0.5x/1.0x bets.
 Measures time to reach specific exploitability targets.
 
 Usage:
-    python benchmarks/bench_river_cfr.py [--iters N] [--algo cfr+|cfr|dcfr]
+    python benchmarks/bench_river_cfr.py [--iters N] [--algo cfr+|cfr|dcfr] [--backend python|rust]
 """
 
 import argparse
@@ -29,6 +29,7 @@ def main():
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--algo", choices=["cfr", "cfr+", "dcfr"], default="cfr+")
     parser.add_argument("--board", default="Ks,Th,7s,4d,2s")
+    parser.add_argument("--backend", choices=["python", "rust"], default="rust")
     args = parser.parse_args()
 
     board = tuple(args.board.split(","))
@@ -60,7 +61,20 @@ def main():
     }
 
     cfg = algo_configs[args.algo]
-    trainer = VectorCFRTrainer(game, cfg)
+
+    use_rust = args.backend == "rust"
+    rust_trainer = None
+    rust_infoset_keys = None
+    rust_action_tokens = None
+
+    if use_rust:
+        from river.rust_bridge import create_rust_trainer
+        rust_trainer, rust_infoset_keys, rust_action_tokens = create_rust_trainer(game, cfg)
+        print(f"Backend: Rust (pyo3)")
+    else:
+        print(f"Backend: Python")
+
+    trainer = None if use_rust else VectorCFRTrainer(game, cfg)
 
     checkpoints = [c for c in CHECKPOINTS if c <= args.iters]
     if args.iters not in checkpoints:
@@ -73,10 +87,15 @@ def main():
     print("-" * 54)
 
     for cp in checkpoints:
-        trainer.run(cp - completed)
-        completed = cp
-        profile = trainer.average_strategy_profile()
-        exp = exploitability(game, profile, summaries, blocked)
+        if use_rust:
+            rust_trainer.run(cp - completed)
+            completed = cp
+            exp, base_pot = rust_trainer.exploitability(game.base_pot)
+        else:
+            trainer.run(cp - completed)
+            completed = cp
+            profile = trainer.average_strategy_profile()
+            exp = exploitability(game, profile, summaries, blocked)
         elapsed = time.time() - start
         pct = exp / game.base_pot * 100
         print(f"{cp:>8d}  {exp:>16.6f}  {pct:>11.4f}%  {elapsed:>10.1f}")
