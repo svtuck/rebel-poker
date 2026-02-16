@@ -5,6 +5,9 @@
 ///
 /// The naive algorithm is O(N_HANDS^2) where N_HANDS = C(52,2) = 1326 for HUNL.
 /// Card-overlap filtering reduces the constant but doesn't change complexity.
+///
+/// Optimized path: call `precompute_payoffs()` once per board to enable O(N) per-hand
+/// counterfactual value computation using sorted hand ranks and prefix sums.
 
 use crate::eval;
 
@@ -23,8 +26,7 @@ pub struct EvContext {
     pub card_to_hands: Vec<Vec<u16>>,
     /// Bitset: which hands are blocked by the board (contain a board card).
     pub board_blocked: Vec<bool>,
-    /// For each hand index, bitset of opponent hand indices that share a card.
-    /// Stored as Vec<Vec<u16>> for the naive implementation.
+    /// For each hand index, list of opponent hand indices that share a card.
     pub hand_conflicts: Vec<Vec<u16>>,
     pub board: Vec<u8>,
     pub board_len: usize,
@@ -32,11 +34,8 @@ pub struct EvContext {
     /// as i8 (+1, -1, 0). Invalid pairs (blocked or conflicting cards) are 0.
     /// None until `precompute_payoffs()` is called.
     payoff_matrix: Option<Vec<i8>>,
-    /// Compact representation: indices of valid (non-blocked) hands, sorted by hand rank.
-    /// Used for O(N log N) prefix-sum algorithm on river.
-    valid_hands: Option<Vec<u16>>,
-    /// Hand rank for each hand index (only meaningful for board_len == 5).
-    /// Lower rank = better hand.
+    /// Hand rank for each hand index (lower = better hand).
+    /// Populated by `precompute_payoffs()` when board_len > 0.
     hand_ranks: Option<Vec<u16>>,
 }
 
@@ -61,7 +60,6 @@ impl EvContext {
                 continue;
             }
             let Hand(c0, c1) = hands[h_idx];
-            // Hands that share c0 or c1
             let mut conflicts = Vec::new();
             for &hi in &card_to_hands[c0 as usize] {
                 if hi as usize != h_idx && !board_blocked[hi as usize] {
@@ -70,7 +68,6 @@ impl EvContext {
             }
             for &hi in &card_to_hands[c1 as usize] {
                 if hi as usize != h_idx && !board_blocked[hi as usize] {
-                    // Avoid duplicates (a hand sharing both cards would appear twice)
                     if !conflicts.contains(&hi) {
                         conflicts.push(hi);
                     }
@@ -87,21 +84,18 @@ impl EvContext {
             board: board.to_vec(),
             board_len: board.len(),
             payoff_matrix: None,
-            valid_hands: None,
             hand_ranks: None,
         }
     }
 
     /// Precompute the payoff matrix for all hand pairs.
-    /// After calling this, `compute_cf_values` will use fast matrix-vector multiply
-    /// instead of per-pair hand evaluation.
-    /// The matrix is NUM_HANDS × NUM_HANDS i8 values ≈ 1.76 MB.
+    /// After calling this, `compute_cf_values` will use the O(N) sorted prefix-sum
+    /// algorithm instead of per-pair hand evaluation.
     pub fn precompute_payoffs(&mut self) {
         let mut matrix = vec![0i8; NUM_HANDS * NUM_HANDS];
 
-        // First, precompute the hand rank for every valid hand.
-        // This avoids redundant eval7/eval5 calls (each hand's rank only depends
-        // on the hand + board, not the opponent).
+        // Precompute the hand rank for every valid hand.
+        // Each hand's rank only depends on the hand + board, not the opponent.
         let mut ranks = vec![0u16; NUM_HANDS];
         for h_idx in 0..NUM_HANDS {
             if self.board_blocked[h_idx] {
@@ -125,11 +119,11 @@ impl EvContext {
                         self.board[0], self.board[1], self.board[2], self.board[3]];
                     best_of_6(&h_cards)
                 }
-                _ => 0, // Preflop: no ranks
+                _ => 0,
             };
         }
 
-        // Now build the payoff matrix using precomputed ranks.
+        // Build the payoff matrix using precomputed ranks.
         for h_idx in 0..NUM_HANDS {
             if self.board_blocked[h_idx] {
                 continue;
@@ -149,7 +143,7 @@ impl EvContext {
 
                 let vr = ranks[opp_idx];
                 let payoff = if self.board_len == 0 {
-                    0i8 // Preflop: can't evaluate
+                    0i8
                 } else if hr < vr {
                     1
                 } else if hr > vr {
@@ -180,15 +174,13 @@ impl EvContext {
                 ev_p1 += reach_p1[i] * cf_p1[i];
             }
         }
-        // Zero-sum: ev_p2 = -ev_p1
         (ev_p1, -ev_p1)
     }
 
     /// Compute per-hand counterfactual values for both players.
     ///
     /// cf_value_p1[h1] = Σ_h2 reach_p2[h2] * payoff[h1][h2]
-    /// cf_value_p2[h2] = Σ_h1 reach_p1[h1] * payoff_p2[h1][h2]
-    ///                  = Σ_h1 reach_p1[h1] * (-payoff[h1][h2])
+    /// cf_value_p2[h2] = Σ_h1 reach_p1[h1] * (-payoff[h1][h2])
     ///
     /// Board-blocked hands get cf_value = 0.
     pub fn compute_cf_values(
@@ -207,12 +199,19 @@ impl EvContext {
     /// Compute counterfactual values for one player.
     ///
     /// cf_value[h] = Σ_opp reach_opp[opp] * payoff(h, opp)
-    /// where payoff(h, opp) is from h's perspective (+1 if h wins, -1 if h loses, 0 tie).
     fn compute_cf_values_one_player(&self, opp_reach: &[f64]) -> Vec<f64> {
+        // Prefer sorted prefix-sum O(N) approach when hand ranks are available.
+        if let Some(ref ranks) = self.hand_ranks {
+            if self.board_len > 0 {
+                return self.compute_cf_values_one_player_sorted(ranks, opp_reach);
+            }
+        }
+        // Fall back to matrix multiply if payoff matrix is available.
         if let Some(ref matrix) = self.payoff_matrix {
-            return self.compute_cf_values_one_player_fast(matrix, opp_reach);
+            return self.compute_cf_values_one_player_matrix(matrix, opp_reach);
         }
 
+        // Naive O(N²) with per-pair hand evaluation.
         let mut cf_values = vec![0.0f64; NUM_HANDS];
 
         for h_idx in 0..NUM_HANDS {
@@ -230,7 +229,6 @@ impl EvContext {
 
                 let opp_hand = self.hands[opp_idx];
 
-                // Check card conflict between the two hands
                 if cards_conflict(hand, opp_hand) {
                     continue;
                 }
@@ -240,7 +238,6 @@ impl EvContext {
                     continue;
                 }
 
-                // Evaluate showdown from hero's perspective
                 let payoff = self.evaluate_payoff(h_idx, opp_idx);
                 cf_val += opp_r * payoff;
             }
@@ -252,10 +249,7 @@ impl EvContext {
     }
 
     /// Fast matrix-vector multiply using precomputed payoff matrix.
-    /// cf_value[h] = Σ_opp payoff[h][opp] * reach_opp[opp]
-    /// Since payoff values are {-1, 0, +1}, we split into add/subtract.
-    #[inline(never)]
-    fn compute_cf_values_one_player_fast(&self, matrix: &[i8], opp_reach: &[f64]) -> Vec<f64> {
+    fn compute_cf_values_one_player_matrix(&self, matrix: &[i8], opp_reach: &[f64]) -> Vec<f64> {
         let mut cf_values = vec![0.0f64; NUM_HANDS];
 
         for h_idx in 0..NUM_HANDS {
@@ -264,19 +258,79 @@ impl EvContext {
             }
 
             let row = &matrix[h_idx * NUM_HANDS..(h_idx + 1) * NUM_HANDS];
-            let mut win_sum = 0.0f64;
-            let mut lose_sum = 0.0f64;
+            let mut cf_val = 0.0f64;
 
             for opp_idx in 0..NUM_HANDS {
-                let p = row[opp_idx];
-                if p > 0 {
-                    win_sum += opp_reach[opp_idx];
-                } else if p < 0 {
-                    lose_sum += opp_reach[opp_idx];
+                cf_val += row[opp_idx] as f64 * opp_reach[opp_idx];
+            }
+
+            cf_values[h_idx] = cf_val;
+        }
+
+        cf_values
+    }
+
+    /// O(N) per hand using sorted ranks and prefix sums.
+    ///
+    /// For hand h with rank r:
+    ///   cf_value[h] = (total reach of worse hands) - (total reach of better hands)
+    ///                 adjusted for card-conflicting hands (~93 per hand)
+    fn compute_cf_values_one_player_sorted(&self, ranks: &[u16], opp_reach: &[f64]) -> Vec<f64> {
+        let mut cf_values = vec![0.0f64; NUM_HANDS];
+
+        // Compute total reach of all valid hands.
+        let mut total_reach = 0.0f64;
+        for h_idx in 0..NUM_HANDS {
+            if !self.board_blocked[h_idx] {
+                total_reach += opp_reach[h_idx];
+            }
+        }
+
+        // For each rank value, compute total reach of hands with that rank.
+        let max_rank = 7463usize;
+        let mut rank_reach = vec![0.0f64; max_rank + 1];
+        for h_idx in 0..NUM_HANDS {
+            if !self.board_blocked[h_idx] {
+                rank_reach[ranks[h_idx] as usize] += opp_reach[h_idx];
+            }
+        }
+
+        // Prefix sum: prefix_reach[r] = total reach of hands with rank < r (strictly better).
+        let mut prefix_reach = vec![0.0f64; max_rank + 2];
+        for r in 0..=max_rank {
+            prefix_reach[r + 1] = prefix_reach[r] + rank_reach[r];
+        }
+
+        // For hand h with rank r:
+        // - better_reach = prefix_reach[r] = reach of hands with rank < r (they beat h)
+        // - worse_reach = total_reach - prefix_reach[r+1] = reach of hands with rank > r
+        // - cf_value[h] = worse_reach - better_reach - conflict_adjustment
+        for h_idx in 0..NUM_HANDS {
+            if self.board_blocked[h_idx] {
+                continue;
+            }
+
+            let r = ranks[h_idx] as usize;
+            let better_reach = prefix_reach[r];
+            let worse_reach = total_reach - prefix_reach[r + 1];
+
+            let mut cf_val = worse_reach - better_reach;
+
+            // Adjust for card conflicts: hands that share a card with h
+            // were included in the prefix sums but shouldn't contribute.
+            for &conflict_idx in &self.hand_conflicts[h_idx] {
+                let cr = ranks[conflict_idx as usize] as usize;
+                let c_reach = opp_reach[conflict_idx as usize];
+                if cr < r {
+                    // Was counted in better_reach (payoff -1), undo it
+                    cf_val += c_reach;
+                } else if cr > r {
+                    // Was counted in worse_reach (payoff +1), undo it
+                    cf_val -= c_reach;
                 }
             }
 
-            cf_values[h_idx] = win_sum - lose_sum;
+            cf_values[h_idx] = cf_val;
         }
 
         cf_values
@@ -289,17 +343,8 @@ impl EvContext {
         let villain = self.hands[villain_idx];
 
         match self.board_len {
-            0 => {
-                // Preflop: no board, can't evaluate showdown.
-                // For preflop EV we'd need to enumerate all possible boards,
-                // which is not what this function does. Return 0 for now.
-                // In practice, preflop EV computation should use a different method
-                // (e.g., EHS or rollout). For the benchmark, we'll still include it
-                // to measure the overhead of the loop.
-                0.0
-            }
+            0 => 0.0,
             5 => {
-                // River: full 7-card evaluation
                 let h7 = [hero.0, hero.1,
                     self.board[0], self.board[1], self.board[2],
                     self.board[3], self.board[4]];
@@ -311,13 +356,8 @@ impl EvContext {
                 if hr < vr { 1.0 } else if hr > vr { -1.0 } else { 0.0 }
             }
             3 | 4 => {
-                // Flop/Turn: would need rollout for proper EV.
-                // For the naive implementation, we do best-of-5 with available cards.
-                // Actually, for flop (3 cards) we have 5 cards total, use eval5.
-                // For turn (4 cards) we have 6 cards, best 5 of 6.
                 match self.board_len {
                     3 => {
-                        // Flop: hero has 2 + board 3 = 5 cards exactly
                         let h5 = [hero.0, hero.1,
                             self.board[0], self.board[1], self.board[2]];
                         let v5 = [villain.0, villain.1,
@@ -327,7 +367,6 @@ impl EvContext {
                         if hr < vr { 1.0 } else if hr > vr { -1.0 } else { 0.0 }
                     }
                     4 => {
-                        // Turn: hero has 2 + board 4 = 6 cards, best 5 of 6
                         let h_cards = [hero.0, hero.1,
                             self.board[0], self.board[1], self.board[2], self.board[3]];
                         let v_cards = [villain.0, villain.1,
@@ -376,7 +415,6 @@ fn cards_conflict(a: Hand, b: Hand) -> bool {
 /// Evaluate best 5 of 6 cards.
 fn best_of_6(cards: &[u8; 6]) -> eval::HandRank {
     let mut best = eval::HandRank::MAX;
-    // C(6,5) = 6 combinations: skip each card in turn
     for skip in 0..6 {
         let mut hand = [0u8; 5];
         let mut j = 0;
@@ -395,11 +433,8 @@ fn best_of_6(cards: &[u8; 6]) -> eval::HandRank {
 }
 
 /// Get the hand index for a given (c0, c1) pair where c0 < c1.
-/// This is the inverse of enumerate_hands().
 pub fn hand_index(c0: u8, c1: u8) -> usize {
     debug_assert!(c0 < c1);
-    // Hand index = sum_{i=0}^{c0-1} (51-i) + (c1 - c0 - 1)
-    // = c0*51 - c0*(c0-1)/2 + c1 - c0 - 1
     let c0 = c0 as usize;
     let c1 = c1 as usize;
     c0 * 51 - c0 * (c0.wrapping_sub(1)) / 2 + c1 - c0 - 1
@@ -450,11 +485,9 @@ mod tests {
 
     #[test]
     fn test_board_blocking() {
-        // Board has Ah (card 50), so any hand containing 50 should be blocked
         let ah = card(RANK_A, SUIT_HEARTS);
         let ctx = EvContext::new(&[ah, card(RANK_K, SUIT_SPADES), card(RANK_Q, SUIT_SPADES),
                                     card(RANK_J, SUIT_SPADES), card(RANK_T, SUIT_SPADES)]);
-        // Hands containing Ah should be blocked
         let hands = enumerate_hands();
         for (i, h) in hands.iter().enumerate() {
             if h.0 == ah || h.1 == ah {
@@ -465,14 +498,12 @@ mod tests {
 
     #[test]
     fn test_card_overlap_exclusion() {
-        // If board has As, no hand containing As should contribute to EV
         let as_card = card(RANK_A, SUIT_SPADES);
         let board = [as_card, card(RANK_K, SUIT_HEARTS), card(RANK_Q, SUIT_HEARTS),
                      card(RANK_J, SUIT_HEARTS), card(RANK_T, SUIT_HEARTS)];
         let ctx = EvContext::new(&board);
 
         let mut reach = vec![0.0; NUM_HANDS];
-        // Set uniform reach for non-blocked hands
         for i in 0..NUM_HANDS {
             if !ctx.board_blocked[i] {
                 reach[i] = 1.0;
@@ -481,7 +512,6 @@ mod tests {
 
         let (cf_p1, cf_p2) = ctx.compute_cf_values(&reach, &reach);
 
-        // Verify blocked hands have zero cf_values
         for (i, h) in ctx.hands.iter().enumerate() {
             if h.0 == as_card || h.1 == as_card {
                 assert_eq!(cf_p1[i], 0.0, "Blocked hand should have zero cf_value");
@@ -492,13 +522,11 @@ mod tests {
 
     #[test]
     fn test_consistency_ev_cf_values() {
-        // ev_p1 should equal sum(reach_p1[h] * cf_p1[h]) for all valid h
         let board = [card(RANK_A, SUIT_SPADES), card(RANK_K, SUIT_HEARTS),
                      card(RANK_Q, SUIT_DIAMONDS), card(RANK_J, SUIT_CLUBS),
                      card(RANK_T, SUIT_SPADES)];
         let ctx = EvContext::new(&board);
 
-        // Use non-uniform reach probabilities
         let mut reach_p1 = vec![0.0; NUM_HANDS];
         let mut reach_p2 = vec![0.0; NUM_HANDS];
         for i in 0..NUM_HANDS {
@@ -524,20 +552,17 @@ mod tests {
         assert!(
             (ev_p1 - sum_p1).abs() < 1e-10,
             "EV p1 ({}) should equal sum of reach*cf ({})",
-            ev_p1,
-            sum_p1
+            ev_p1, sum_p1
         );
         assert!(
             (ev_p2 - sum_p2).abs() < 1e-10,
             "EV p2 ({}) should equal sum of reach*cf ({})",
-            ev_p2,
-            sum_p2
+            ev_p2, sum_p2
         );
     }
 
     #[test]
     fn test_zero_sum() {
-        // In a zero-sum game, ev_p1 + ev_p2 = 0
         let board = [card(RANK_A, SUIT_SPADES), card(RANK_K, SUIT_HEARTS),
                      card(RANK_Q, SUIT_DIAMONDS), card(RANK_J, SUIT_CLUBS),
                      card(RANK_T, SUIT_SPADES)];
@@ -556,16 +581,12 @@ mod tests {
         assert!(
             (ev_p1 + ev_p2).abs() < 1e-10,
             "Zero sum violated: {} + {} = {}",
-            ev_p1,
-            ev_p2,
-            ev_p1 + ev_p2
+            ev_p1, ev_p2, ev_p1 + ev_p2
         );
     }
 
     #[test]
     fn test_river_known_hands() {
-        // Board: Ac Kd 7h 4s 2d
-        // Hero: As Ah (three aces) vs Villain: 3c 5s (nothing useful)
         let board = [
             card(RANK_A, SUIT_CLUBS), card(RANK_K, SUIT_DIAMONDS),
             card(RANK_7, SUIT_HEARTS), card(RANK_4, SUIT_SPADES),
@@ -579,16 +600,12 @@ mod tests {
         assert!(!ctx.board_blocked[hero_idx]);
         assert!(!ctx.board_blocked[villain_idx]);
 
-        // Three aces should beat K-high
         let payoff = ctx.evaluate_payoff(hero_idx, villain_idx);
         assert_eq!(payoff, 1.0, "Three aces should beat K-high");
 
-        // From villain's perspective
         let payoff_v = ctx.evaluate_payoff(villain_idx, hero_idx);
         assert_eq!(payoff_v, -1.0, "K-high should lose to three aces");
 
-        // Test a tie: hero and villain both have the same kicker situation
-        // Board: Ac Kd 7h 4s 2d, both hold Qs Jh and Qh Js — same rank kickers, tie
         let h1 = hand_index_unordered(card(RANK_Q, SUIT_SPADES), card(RANK_J, SUIT_HEARTS));
         let h2 = hand_index_unordered(card(RANK_Q, SUIT_HEARTS), card(RANK_J, SUIT_SPADES));
         assert!(!ctx.board_blocked[h1]);
@@ -599,7 +616,7 @@ mod tests {
 
     #[test]
     fn test_precomputed_matches_naive() {
-        // Verify that precomputed payoff matrix gives identical results to naive
+        // Verify that precomputed/sorted approach gives identical results to naive
         let board = [card(RANK_A, SUIT_SPADES), card(RANK_K, SUIT_HEARTS),
                      card(RANK_Q, SUIT_DIAMONDS), card(RANK_J, SUIT_CLUBS),
                      card(RANK_T, SUIT_SPADES)];
@@ -608,7 +625,6 @@ mod tests {
         let mut ctx_fast = EvContext::new(&board);
         ctx_fast.precompute_payoffs();
 
-        // Non-uniform reach probabilities
         let mut reach_p1 = vec![0.0; NUM_HANDS];
         let mut reach_p2 = vec![0.0; NUM_HANDS];
         for i in 0..NUM_HANDS {
@@ -623,30 +639,94 @@ mod tests {
 
         for i in 0..NUM_HANDS {
             assert!(
-                (cf_naive_p1[i] - cf_fast_p1[i]).abs() < 1e-10,
-                "cf_p1 mismatch at {}: naive={}, fast={}",
-                i, cf_naive_p1[i], cf_fast_p1[i]
+                (cf_naive_p1[i] - cf_fast_p1[i]).abs() < 1e-8,
+                "cf_p1 mismatch at {}: naive={}, fast={}, diff={}",
+                i, cf_naive_p1[i], cf_fast_p1[i], (cf_naive_p1[i] - cf_fast_p1[i]).abs()
             );
             assert!(
-                (cf_naive_p2[i] - cf_fast_p2[i]).abs() < 1e-10,
-                "cf_p2 mismatch at {}: naive={}, fast={}",
-                i, cf_naive_p2[i], cf_fast_p2[i]
+                (cf_naive_p2[i] - cf_fast_p2[i]).abs() < 1e-8,
+                "cf_p2 mismatch at {}: naive={}, fast={}, diff={}",
+                i, cf_naive_p2[i], cf_fast_p2[i], (cf_naive_p2[i] - cf_fast_p2[i]).abs()
             );
         }
 
-        // Also check EV
+        // EV check (prefix-sum reordering slightly changes fp accumulation)
         let (ev_naive_p1, _) = ctx_naive.compute_ev(&reach_p1, &reach_p2);
         let (ev_fast_p1, _) = ctx_fast.compute_ev(&reach_p1, &reach_p2);
         assert!(
-            (ev_naive_p1 - ev_fast_p1).abs() < 1e-10,
-            "EV mismatch: naive={}, fast={}",
-            ev_naive_p1, ev_fast_p1
+            (ev_naive_p1 - ev_fast_p1).abs() < 1e-6,
+            "EV mismatch: naive={}, fast={}, diff={}",
+            ev_naive_p1, ev_fast_p1, (ev_naive_p1 - ev_fast_p1).abs()
         );
     }
 
     #[test]
+    fn test_precomputed_zero_sum() {
+        // Zero-sum property should hold with precomputed path
+        let board = [card(RANK_A, SUIT_SPADES), card(RANK_K, SUIT_HEARTS),
+                     card(RANK_Q, SUIT_DIAMONDS), card(RANK_J, SUIT_CLUBS),
+                     card(RANK_T, SUIT_SPADES)];
+        let mut ctx = EvContext::new(&board);
+        ctx.precompute_payoffs();
+
+        let mut reach_p1 = vec![0.0; NUM_HANDS];
+        let mut reach_p2 = vec![0.0; NUM_HANDS];
+        for i in 0..NUM_HANDS {
+            if !ctx.board_blocked[i] {
+                reach_p1[i] = 1.0;
+                reach_p2[i] = 1.0;
+            }
+        }
+
+        let (ev_p1, ev_p2) = ctx.compute_ev(&reach_p1, &reach_p2);
+        assert!(
+            (ev_p1 + ev_p2).abs() < 1e-8,
+            "Zero sum violated: {} + {} = {}",
+            ev_p1, ev_p2, ev_p1 + ev_p2
+        );
+    }
+
+    #[test]
+    fn test_precomputed_different_board() {
+        // Test with a different board to verify generality
+        let board = [
+            card(RANK_2, SUIT_CLUBS), card(RANK_5, SUIT_DIAMONDS),
+            card(RANK_8, SUIT_HEARTS), card(RANK_J, SUIT_SPADES),
+            card(RANK_A, SUIT_CLUBS),
+        ];
+
+        let ctx_naive = EvContext::new(&board);
+        let mut ctx_fast = EvContext::new(&board);
+        ctx_fast.precompute_payoffs();
+
+        let mut reach_p1 = vec![0.0; NUM_HANDS];
+        let mut reach_p2 = vec![0.0; NUM_HANDS];
+        for i in 0..NUM_HANDS {
+            if !ctx_naive.board_blocked[i] {
+                reach_p1[i] = ((i * 7 + 3) % 100) as f64 / 100.0;
+                reach_p2[i] = ((i * 13 + 11) % 100) as f64 / 100.0;
+            }
+        }
+
+        let (cf_naive_p1, cf_naive_p2) = ctx_naive.compute_cf_values(&reach_p1, &reach_p2);
+        let (cf_fast_p1, cf_fast_p2) = ctx_fast.compute_cf_values(&reach_p1, &reach_p2);
+
+        for i in 0..NUM_HANDS {
+            assert!(
+                (cf_naive_p1[i] - cf_fast_p1[i]).abs() < 1e-8,
+                "cf_p1 mismatch at {}: naive={}, fast={}",
+                i, cf_naive_p1[i], cf_fast_p1[i]
+            );
+            assert!(
+                (cf_naive_p2[i] - cf_fast_p2[i]).abs() < 1e-8,
+                "cf_p2 mismatch at {}: naive={}, fast={}",
+                i, cf_naive_p2[i], cf_fast_p2[i]
+            );
+        }
+    }
+
+    #[test]
     fn test_symmetric_uniform_river() {
-        // With uniform reach and symmetric game, EV should be 0
         let board = [
             card(RANK_A, SUIT_SPADES), card(RANK_K, SUIT_HEARTS),
             card(RANK_Q, SUIT_DIAMONDS), card(RANK_J, SUIT_CLUBS),
@@ -662,8 +742,6 @@ mod tests {
         }
 
         let (ev_p1, _ev_p2) = ctx.compute_ev(&reach, &reach);
-        // With identical reach probabilities, the game is symmetric,
-        // so EV should be exactly 0
         assert!(
             ev_p1.abs() < 1e-10,
             "Uniform reach EV should be 0, got {}",
