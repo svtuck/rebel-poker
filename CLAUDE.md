@@ -90,17 +90,19 @@ The core files in `rebel/` (`rebel_trainer.py`, `value_net.py`, `endgame_solver.
 ## Commands
 
 ```bash
-# Install
-pip install -e .
+# Full setup (Python venv + Rust crates)
+make setup
 
-# Run tests (164 tests)
-pytest tests/ -v
+# Or step by step:
+make setup-python    # Create venv, install Python deps + maturin
+make setup-rust      # Build poker-engine + rust_cfr via maturin
 
-# Skip slow tests
-pytest tests/ -m "not slow"
+# Rebuild Rust crates after changes
+make build
 
-# Run specific test file
-pytest tests/test_kuhn_cfr.py -v
+# Run tests
+make test            # All tests
+make test-fast       # Skip slow tests
 
 # Solve Kuhn poker
 python run_kuhn.py           # Default iterations
@@ -117,9 +119,6 @@ python ui/server.py          # http://localhost:5050
 # Benchmarks
 python benchmarks/bench_cfr_solvers.py
 python benchmarks/bench_river_cfr.py
-
-# Rust poker engine (requires Rust toolchain)
-cd poker-engine && maturin develop
 ```
 
 ## Dependencies
@@ -128,7 +127,9 @@ cd poker-engine && maturin develop
 - `torch >= 2.0` — tensor ops, neural networks
 - `flask >= 3.0` — web UI
 - `pytest >= 7.0` — testing
-- `maturin` + Rust toolchain — only for HUNL (PyO3 bindings)
+- Rust toolchain (rustup.rs) + `maturin` — for `poker-engine` and `rust_cfr` PyO3 crates
+
+`make setup` installs everything including Rust crates.
 
 ## Directory Structure
 

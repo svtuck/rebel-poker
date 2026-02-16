@@ -15,6 +15,7 @@ import random
 from game_interface import Game
 from leduc.game import LeducPoker, DECK, RANKS, RANK_TO_STR
 from cfr.solver import CFRTrainer, CFRConfig
+from cfr.vectorized import VectorizedCFR
 from leduc.belief_state import (
     ALL_PRIVATE_DEALS,
     ALL_FULL_DEALS,
@@ -277,6 +278,64 @@ class TestLeducCardAbstraction:
                 if rank != board_rank:
                     nonpair_bucket = postflop_bucket(rank, board_rank)
                     assert pair_bucket > nonpair_bucket
+
+
+class TestLeducVectorizedCFR:
+    @pytest.mark.slow
+    def test_vectorized_cfr_convergence(self):
+        """VectorizedCFR should converge on Leduc with mid-tree chance nodes."""
+        vcfr = VectorizedCFR(LeducPoker())
+        # Run without exploitability checks for speed
+        game = LeducPoker()
+        initial = game.initial_state()
+        for i in range(1000):
+            deal_states = [game.next_state(initial, deal) for deal in vcfr.all_deals]
+            vcfr._cfr_vectorized(
+                deal_states, vcfr.deal_probs.clone(), vcfr.deal_probs.clone()
+            )
+            vcfr.iteration += 1
+        exp = vcfr._exploitability()
+        assert exp < 0.05, f"VectorizedCFR exploitability {exp:.6f} too high after 1000 iters"
+
+    def test_vectorized_cfr_discovers_all_infosets(self):
+        """VectorizedCFR should discover all 288 Leduc infosets."""
+        vcfr = VectorizedCFR(LeducPoker())
+        assert len(vcfr._infoset_deal_indices) == 288
+
+    def test_vectorized_cfr_handles_chance_node(self):
+        """VectorizedCFR should not crash on Leduc's mid-tree board card deal."""
+        vcfr = VectorizedCFR(LeducPoker())
+        exps = vcfr.train(10)
+        assert len(exps) > 0
+        assert all(e > 0 for e in exps)
+
+    @pytest.mark.slow
+    def test_vectorized_matches_scalar_direction(self):
+        """VectorizedCFR strategies should converge toward same Nash as scalar."""
+        scalar = CFRTrainer(LeducPoker())
+        scalar.train(500)
+        scalar_profile = scalar.average_strategy_profile()
+
+        vcfr = VectorizedCFR(LeducPoker())
+        game = LeducPoker()
+        initial = game.initial_state()
+        for i in range(1000):
+            deal_states = [game.next_state(initial, deal) for deal in vcfr.all_deals]
+            vcfr._cfr_vectorized(
+                deal_states, vcfr.deal_probs.clone(), vcfr.deal_probs.clone()
+            )
+            vcfr.iteration += 1
+        vector_profile = vcfr.average_strategy_profile()
+
+        # Check round 1 strategies are in same direction
+        for key in ["K-|", "J-|", "Q-|"]:
+            if key in scalar_profile and key in vector_profile:
+                for action in scalar_profile[key]:
+                    s = scalar_profile[key][action]
+                    v = vector_profile[key].get(action, 0.5)
+                    assert abs(s - v) < 0.2, (
+                        f"Strategy mismatch at {key}/{action}: scalar={s:.3f}, vector={v:.3f}"
+                    )
 
 
 class TestLeducRebelTrainer:
