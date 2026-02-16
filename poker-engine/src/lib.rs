@@ -1,5 +1,6 @@
 pub mod card;
 pub mod eval;
+pub mod ev;
 pub mod state;
 pub mod abstraction;
 

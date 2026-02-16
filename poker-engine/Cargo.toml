@@ -21,6 +21,10 @@ criterion = "0.5"
 name = "hand_eval"
 harness = false
 
+[[bench]]
+name = "ev_calc"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = true
