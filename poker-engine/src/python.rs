@@ -2,6 +2,7 @@ use pyo3::prelude::*;
 
 use crate::abstraction;
 use crate::card;
+use crate::ev;
 use crate::eval;
 use crate::state;
 
@@ -40,6 +41,11 @@ fn poker_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_compute_turn_buckets, m)?)?;
     m.add_class::<PyCardAbstraction>()?;
 
+    // EV computation
+    m.add_class::<PyEvContext>()?;
+    m.add_function(wrap_pyfunction!(py_enumerate_hands, m)?)?;
+    m.add_function(wrap_pyfunction!(py_hand_index, m)?)?;
+
     // Batch operations
     m.add_function(wrap_pyfunction!(py_batch_apply_action, m)?)?;
     m.add_function(wrap_pyfunction!(py_batch_terminal_utility, m)?)?;
@@ -52,6 +58,7 @@ fn poker_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("SMALL_BLIND", state::SMALL_BLIND)?;
     m.add("BIG_BLIND", state::BIG_BLIND)?;
     m.add("NUM_PREFLOP_BUCKETS", abstraction::NUM_PREFLOP_BUCKETS)?;
+    m.add("NUM_HANDS", ev::NUM_HANDS)?;
 
     Ok(())
 }
@@ -553,4 +560,80 @@ fn py_batch_infoset_keys(states: Vec<PyGameState>, player: usize) -> Vec<String>
         .iter()
         .map(|s| s.inner.infoset_key(player))
         .collect()
+}
+
+// --- EV computation bindings ---
+
+#[pyclass]
+pub struct PyEvContext {
+    inner: ev::EvContext,
+}
+
+#[pymethods]
+impl PyEvContext {
+    #[new]
+    fn new(board: Vec<u8>) -> Self {
+        PyEvContext {
+            inner: ev::EvContext::new(&board),
+        }
+    }
+
+    /// Compute scalar EV for each player.
+    /// reach_p1, reach_p2: lists of 1326 floats (reach probability per hand).
+    /// Returns (ev_p1, ev_p2).
+    fn compute_ev(&self, reach_p1: Vec<f64>, reach_p2: Vec<f64>) -> PyResult<(f64, f64)> {
+        if reach_p1.len() != ev::NUM_HANDS || reach_p2.len() != ev::NUM_HANDS {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("reach arrays must have length {}", ev::NUM_HANDS),
+            ));
+        }
+        Ok(self.inner.compute_ev(&reach_p1, &reach_p2))
+    }
+
+    /// Compute per-hand counterfactual values for both players.
+    /// Returns (cf_values_p1, cf_values_p2), each a list of 1326 floats.
+    fn compute_cf_values(
+        &self,
+        reach_p1: Vec<f64>,
+        reach_p2: Vec<f64>,
+    ) -> PyResult<(Vec<f64>, Vec<f64>)> {
+        if reach_p1.len() != ev::NUM_HANDS || reach_p2.len() != ev::NUM_HANDS {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("reach arrays must have length {}", ev::NUM_HANDS),
+            ));
+        }
+        Ok(self.inner.compute_cf_values(&reach_p1, &reach_p2))
+    }
+
+    /// Get which hands are blocked by the board.
+    fn board_blocked(&self) -> Vec<bool> {
+        self.inner.board_blocked.clone()
+    }
+
+    /// Get the number of valid (non-blocked) hands.
+    fn num_valid_hands(&self) -> usize {
+        self.inner.board_blocked.iter().filter(|&&b| !b).count()
+    }
+
+    /// Precompute the payoff matrix for fast cf_values computation.
+    /// Call this once per board, then all subsequent compute_cf_values calls
+    /// will use the precomputed matrix (10-100x faster for river HUNL).
+    fn precompute_payoffs(&mut self) {
+        self.inner.precompute_payoffs();
+    }
+
+    fn __repr__(&self) -> String {
+        let valid = self.num_valid_hands();
+        format!("EvContext(board_len={}, valid_hands={})", self.inner.board_len, valid)
+    }
+}
+
+#[pyfunction]
+fn py_enumerate_hands() -> Vec<(u8, u8)> {
+    ev::enumerate_hands().iter().map(|h| (h.0, h.1)).collect()
+}
+
+#[pyfunction]
+fn py_hand_index(card0: u8, card1: u8) -> usize {
+    ev::hand_index_unordered(card0, card1)
 }
